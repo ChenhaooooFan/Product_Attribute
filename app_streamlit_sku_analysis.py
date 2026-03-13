@@ -62,9 +62,9 @@ def split_multi_value(x):
     seen = set()
     deduped = []
     for item in cleaned:
-        k = item.lower()
-        if k not in seen:
-            seen.add(k)
+        key = item.lower()
+        if key not in seen:
+            seen.add(key)
             deduped.append(item)
     return deduped
 
@@ -128,6 +128,7 @@ def choose_attribute_columns(df):
         "SKU", "中文名称", "款式英文名称", "图片", "上架时间",
         "Seller SKU", "Base SKU", "Period", "Mapped"
     }
+
     candidates = []
     for col in df.columns:
         if col in excluded:
@@ -184,6 +185,7 @@ def compare_periods(cur_df, prev_df, attr_col):
         "refund": "refund_cur",
         "sku_count": "sku_count_cur",
     })
+
     prev = aggregate_by_attribute(prev_df, attr_col).rename(columns={
         "order_lines": "order_lines_prev",
         "units": "units_prev",
@@ -207,6 +209,7 @@ def compare_periods(cur_df, prev_df, attr_col):
 
 def build_heatmap_source(df, attr_x, attr_y, metric):
     tmp = df.copy()
+
     tmp["_x_items"] = tmp[attr_x].apply(split_multi_value)
     tmp["_y_items"] = tmp[attr_y].apply(split_multi_value)
 
@@ -249,6 +252,7 @@ def keep_top_labels(src_df, attr_x, attr_y, value_col="value", top_n=12):
         .head(top_n)
         .index
     )
+
     top_y = (
         src_df.groupby(attr_y)[value_col]
         .sum()
@@ -302,16 +306,25 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
     st.markdown(f"**{title}**")
 
     if px is not None:
-        color_scale = "RdYlGn" if diff else "YlOrRd"
-        zmid = 0 if diff else None
+        if diff:
+            max_abs = float(np.abs(matrix.values).max()) if matrix.size else 0.0
+            if max_abs == 0:
+                max_abs = 1.0
 
-        fig = px.imshow(
-            matrix,
-            text_auto=True,
-            aspect="auto",
-            color_continuous_scale=color_scale,
-            zmid=zmid,
-        )
+            fig = px.imshow(
+                matrix,
+                text_auto=True,
+                aspect="auto",
+                color_continuous_scale="RdYlGn",
+                range_color=[-max_abs, max_abs],
+            )
+        else:
+            fig = px.imshow(
+                matrix,
+                text_auto=True,
+                aspect="auto",
+                color_continuous_scale="YlOrRd",
+            )
 
         fig.update_traces(
             textfont_size=12,
@@ -326,7 +339,9 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
             height=max(420, 42 * len(matrix.index)),
             margin=dict(l=20, r=20, t=60, b=20),
         )
+
         st.plotly_chart(fig, use_container_width=True)
+
     else:
         if diff:
             styled = matrix.style.format("{:.2f}").background_gradient(cmap="RdYlGn", axis=None)
@@ -365,6 +380,7 @@ selected_status = st.sidebar.multiselect(
     options=["Shipped", "Completed", "To ship", "Canceled", "Unknown"],
     default=["Shipped", "Completed"],
 )
+
 mapped_only = st.sidebar.checkbox("只分析成功映射属性的记录", value=True)
 
 metric_choice = st.sidebar.selectbox(
@@ -483,8 +499,8 @@ try:
     )
 
     pair_options = list(combinations(selected_attrs, 2))
-
     display_pairs = []
+
     if heatmap_mode == "自动推荐 Top 组合":
         pair_scores = []
         for attr_x, attr_y in pair_options:
