@@ -3,18 +3,20 @@ from itertools import combinations
 
 import numpy as np
 import pandas as pd
-import plotly.express as px
 import streamlit as st
+
+try:
+    import plotly.express as px
+except Exception:
+    px = None
+
 
 st.set_page_config(page_title="SKU 属性销售分析", layout="wide")
 
 st.title("SKU 属性销售分析仪表盘")
-st.caption("上传近7天销售数据、过去7天销售数据、SKU属性对照表后，自动完成属性映射、周对比与两两属性 Heat Map 分析。")
+st.caption("上传近7天销售数据、过去7天销售数据、SKU属性对照表后，自动完成 SKU 映射、单属性分析、两两属性 Heat Map 分析。")
 
 
-# =========================
-# 工具函数
-# =========================
 def clean_text(x):
     if pd.isna(x):
         return np.nan
@@ -22,31 +24,49 @@ def clean_text(x):
     return x if x != "" else np.nan
 
 
+def safe_numeric(series):
+    return pd.to_numeric(series, errors="coerce").fillna(0)
+
+
 def normalize_base_sku(sku: str):
-    """把销售表里的 Seller SKU 标准化为基础 SKU。
-    例：NPF015-M -> NPF015
-        NPJ005-S -> NPJ005
-    """
     if pd.isna(sku):
         return np.nan
     sku = str(sku).strip().upper()
     sku = sku.split("-")[0]
 
-    # 优先匹配常见结构：N + 1~2个字母 + [F/X/J] + 3位数字
-    m = re.search(r"N[A-Z]{1,2}[FXJ]\d{3}", sku)
+    m = re.search(r"N[A-Z]{1,2}[FXJS]\d{3}", sku)
     if m:
         return m.group(0)
 
-    # 兜底：N + 2~3位字母/数字组合 + 3位数字
-    m = re.search(r"N[A-Z0-9]{2,3}\d{3}", sku)
+    m = re.search(r"N[A-Z0-9]{2,4}\d{3}", sku)
     if m:
         return m.group(0)
 
     return sku
 
 
-def safe_numeric(series):
-    return pd.to_numeric(series, errors="coerce").fillna(0)
+def split_multi_value(x):
+    if pd.isna(x):
+        return []
+    text = str(x).strip()
+    if text == "":
+        return []
+
+    parts = re.split(r"[;,，、/|]+", text)
+    cleaned = []
+    for p in parts:
+        item = str(p).strip()
+        if item and item.lower() not in {"nan", "none", "null"}:
+            cleaned.append(item)
+
+    seen = set()
+    deduped = []
+    for item in cleaned:
+        k = item.lower()
+        if k not in seen:
+            seen.add(k)
+            deduped.append(item)
+    return deduped
 
 
 def load_sales(file, label: str):
@@ -85,6 +105,7 @@ def load_sales(file, label: str):
 def load_attr(file):
     attr = pd.read_csv(file)
     attr.columns = [str(c).strip() for c in attr.columns]
+
     if "SKU" not in attr.columns:
         raise ValueError("属性对照表缺少必要列: SKU")
 
@@ -115,10 +136,12 @@ def choose_attribute_columns(df):
             continue
         if pd.api.types.is_numeric_dtype(df[col]):
             continue
+
         non_null = df[col].notna().sum()
         nunique = df[col].nunique(dropna=True)
         if non_null > 0 and nunique >= 2:
             candidates.append(col)
+
     return candidates
 
 
@@ -131,16 +154,25 @@ def apply_filters(df, selected_status, mapped_only):
     return out
 
 
-def aggregate_by_attribute(df, attr_col):
+def explode_attribute(df, attr_col):
     tmp = df.copy()
-    tmp[attr_col] = tmp[attr_col].fillna("(空值)")
-    g = tmp.groupby(attr_col, dropna=False).agg(
+    tmp["_attr_item"] = tmp[attr_col].apply(split_multi_value)
+    tmp["_attr_item"] = tmp["_attr_item"].apply(lambda x: x if len(x) > 0 else ["(空值)"])
+    tmp = tmp.explode("_attr_item")
+    tmp["_attr_item"] = tmp["_attr_item"].fillna("(空值)")
+    return tmp
+
+
+def aggregate_by_attribute(df, attr_col):
+    tmp = explode_attribute(df, attr_col)
+    g = tmp.groupby("_attr_item", dropna=False).agg(
         order_lines=("Seller SKU", "count"),
         units=("Quantity", "sum"),
         sales=("Sales", "sum"),
         refund=("Refund Amount", "sum"),
         sku_count=("Base SKU", "nunique")
-    ).reset_index()
+    ).reset_index().rename(columns={"_attr_item": attr_col})
+
     return g.sort_values("sales", ascending=False)
 
 
@@ -159,6 +191,7 @@ def compare_periods(cur_df, prev_df, attr_col):
         "refund": "refund_prev",
         "sku_count": "sku_count_prev",
     })
+
     merged = cur.merge(prev, on=attr_col, how="outer").fillna(0)
 
     for metric in ["order_lines", "units", "sales", "refund", "sku_count"]:
@@ -174,22 +207,134 @@ def compare_periods(cur_df, prev_df, attr_col):
 
 def build_heatmap_source(df, attr_x, attr_y, metric):
     tmp = df.copy()
-    tmp[attr_x] = tmp[attr_x].fillna("(空值)")
-    tmp[attr_y] = tmp[attr_y].fillna("(空值)")
+    tmp["_x_items"] = tmp[attr_x].apply(split_multi_value)
+    tmp["_y_items"] = tmp[attr_y].apply(split_multi_value)
+
+    tmp["_x_items"] = tmp["_x_items"].apply(lambda x: x if len(x) > 0 else ["(空值)"])
+    tmp["_y_items"] = tmp["_y_items"].apply(lambda x: x if len(x) > 0 else ["(空值)"])
+
+    tmp = tmp.explode("_x_items")
+    tmp = tmp.explode("_y_items")
+
+    tmp["_x_items"] = tmp["_x_items"].fillna("(空值)")
+    tmp["_y_items"] = tmp["_y_items"].fillna("(空值)")
 
     metric_map = {
-        "units": "Quantity",
         "sales": "Sales",
+        "units": "Quantity",
         "order_lines": "Seller SKU",
         "refund": "Refund Amount",
     }
 
     if metric == "order_lines":
-        pivot = tmp.groupby([attr_y, attr_x]).size().reset_index(name="value")
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False).size().reset_index(name="value")
     else:
-        pivot = tmp.groupby([attr_y, attr_x], dropna=False)[metric_map[metric]].sum().reset_index(name="value")
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)[metric_map[metric]].sum().reset_index(name="value")
 
-    return pivot
+    src = src.rename(columns={
+        "_x_items": attr_x,
+        "_y_items": attr_y
+    })
+    return src
+
+
+def keep_top_labels(src_df, attr_x, attr_y, value_col="value", top_n=12):
+    if len(src_df) == 0:
+        return src_df.copy()
+
+    top_x = (
+        src_df.groupby(attr_x)[value_col]
+        .sum()
+        .sort_values(ascending=False)
+        .head(top_n)
+        .index
+    )
+    top_y = (
+        src_df.groupby(attr_y)[value_col]
+        .sum()
+        .sort_values(ascending=False)
+        .head(top_n)
+        .index
+    )
+
+    out = src_df[src_df[attr_x].isin(top_x) & src_df[attr_y].isin(top_y)].copy()
+    return out
+
+
+def sort_matrix(matrix):
+    row_order = matrix.sum(axis=1).sort_values(ascending=False).index
+    col_order = matrix.sum(axis=0).sort_values(ascending=False).index
+    return matrix.loc[row_order, col_order]
+
+
+def render_bar_chart(plot_df, x_col, title, y_label):
+    if px is not None:
+        fig = px.bar(
+            plot_df,
+            x=x_col,
+            y="value",
+            color="period",
+            barmode="group",
+            title=title,
+            text_auto=".2s",
+        )
+        fig.update_layout(
+            xaxis_title=x_col,
+            yaxis_title=y_label,
+            xaxis_tickangle=-35,
+            height=500,
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        pivot_bar = plot_df.pivot(index=x_col, columns="period", values="value").fillna(0)
+        st.bar_chart(pivot_bar)
+        st.caption("当前环境未安装 plotly，已自动切换为 Streamlit 原生柱状图。")
+
+
+def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
+    if len(src_df) == 0:
+        st.info("该组合没有数据。")
+        return
+
+    matrix = src_df.pivot(index=attr_y, columns=attr_x, values=value_col).fillna(0)
+    matrix = sort_matrix(matrix)
+
+    st.markdown(f"**{title}**")
+
+    if px is not None:
+        color_scale = "RdYlGn" if diff else "YlOrRd"
+        zmid = 0 if diff else None
+
+        fig = px.imshow(
+            matrix,
+            text_auto=True,
+            aspect="auto",
+            color_continuous_scale=color_scale,
+            zmid=zmid,
+        )
+
+        fig.update_traces(
+            textfont_size=12,
+            hovertemplate=f"{attr_y}: %{{y}}<br>{attr_x}: %{{x}}<br>值: %{{z:,.2f}}<extra></extra>"
+        )
+
+        fig.update_layout(
+            title=title,
+            xaxis_title=attr_x,
+            yaxis_title=attr_y,
+            xaxis_tickangle=-40,
+            height=max(420, 42 * len(matrix.index)),
+            margin=dict(l=20, r=20, t=60, b=20),
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    else:
+        if diff:
+            styled = matrix.style.format("{:.2f}").background_gradient(cmap="RdYlGn", axis=None)
+        else:
+            styled = matrix.style.format("{:.2f}").background_gradient(cmap="YlOrRd", axis=None)
+
+        st.dataframe(styled, use_container_width=True)
+        st.caption("当前环境未安装 plotly，已自动切换为表格热力图。")
 
 
 def show_kpi_row(cur_df, prev_df):
@@ -209,38 +354,32 @@ def show_kpi_row(cur_df, prev_df):
     c4.metric("SKU映射率", f"{cur_map:.1%}", f"{(cur_map - prev_map):.1%}")
 
 
-# =========================
-# 侧边栏上传
-# =========================
 st.sidebar.header("上传文件")
 current_file = st.sidebar.file_uploader("近 7 天销售数据（CSV）", type=["csv"], key="current")
 previous_file = st.sidebar.file_uploader("过去 7 天销售数据（CSV）", type=["csv"], key="previous")
 attr_file = st.sidebar.file_uploader("SKU 属性对照表（CSV）", type=["csv"], key="attr")
 
 st.sidebar.header("分析设置")
-default_status = ["Shipped", "Completed"]
 selected_status = st.sidebar.multiselect(
     "纳入哪些订单状态",
     options=["Shipped", "Completed", "To ship", "Canceled", "Unknown"],
-    default=default_status,
+    default=["Shipped", "Completed"],
 )
 mapped_only = st.sidebar.checkbox("只分析成功映射属性的记录", value=True)
+
 metric_choice = st.sidebar.selectbox(
     "Heat Map 指标",
     options=["sales", "units", "order_lines", "refund"],
     index=0,
 )
-max_pair_count = st.sidebar.slider("最多展示多少组属性组合", min_value=1, max_value=15, value=6)
 
+max_pair_count = st.sidebar.slider("自动模式最多展示多少组属性组合", min_value=1, max_value=15, value=6)
+heatmap_top_n = st.sidebar.slider("Heat Map 每轴最多保留多少个属性词", min_value=5, max_value=30, value=12)
 
 if not (current_file and previous_file and attr_file):
     st.info("请先在左侧上传 3 个 CSV 文件。")
     st.stop()
 
-
-# =========================
-# 主流程
-# =========================
 try:
     sales_cur = load_sales(current_file, "近7天")
     sales_prev = load_sales(previous_file, "过去7天")
@@ -254,11 +393,11 @@ try:
 
     attribute_cols = choose_attribute_columns(attr_df)
     if len(attribute_cols) < 2:
-        st.error("属性对照表里可用于分析的属性列不足 2 个，请检查 Season / Color / Style / Holiday / Design Elements 等列。")
+        st.error("属性对照表里可用于分析的属性列不足 2 个。")
         st.stop()
 
     selected_attrs = st.multiselect(
-        "选择要分析的属性列",
+        "选择要纳入分析的属性列",
         options=attribute_cols,
         default=attribute_cols,
     )
@@ -271,6 +410,7 @@ try:
 
     with st.expander("映射质量检查", expanded=False):
         col1, col2 = st.columns(2)
+
         with col1:
             st.subheader("近7天未映射 SKU")
             unmapped_cur = (
@@ -280,6 +420,7 @@ try:
                 .sort_values("count", ascending=False)
             )
             st.dataframe(unmapped_cur, use_container_width=True, hide_index=True)
+
         with col2:
             st.subheader("过去7天未映射 SKU")
             unmapped_prev = (
@@ -294,8 +435,8 @@ try:
     st.header("单属性销售分析")
 
     focus_attr = st.selectbox("选择一个属性看周对比", options=selected_attrs)
-    comp_df = compare_periods(merged_cur, merged_prev, focus_attr)
 
+    comp_df = compare_periods(merged_cur, merged_prev, focus_attr)
     display_cols = [
         focus_attr,
         "sales_cur", "sales_prev", "sales_diff", "sales_pct",
@@ -304,7 +445,6 @@ try:
         "refund_cur", "refund_prev", "refund_diff", "refund_pct",
         "sku_count_cur", "sku_count_prev", "sku_count_diff", "sku_count_pct",
     ]
-
     st.dataframe(comp_df[display_cols], use_container_width=True, hide_index=True)
 
     chart_metric = st.radio(
@@ -321,105 +461,124 @@ try:
         f"{chart_metric}_prev": "过去7天",
     })
 
-    fig_bar = px.bar(
-        plot_df,
-        x=focus_attr,
-        y="value",
-        color="period",
-        barmode="group",
+    render_bar_chart(
+        plot_df=plot_df,
+        x_col=focus_attr,
         title=f"{focus_attr} - 近7天 vs 过去7天",
+        y_label=chart_metric,
     )
-    fig_bar.update_layout(xaxis_title=focus_attr, yaxis_title=chart_metric)
-    st.plotly_chart(fig_bar, use_container_width=True)
 
     st.markdown("---")
     st.header("两两属性 Heat Map")
+    st.caption("这里会先把一个单元格中的多标签属性拆开，再按单个属性词统计，所以坐标轴只会显示单个标签。")
 
     if len(selected_attrs) < 2:
         st.warning("至少需要 2 个属性列才能生成 Heat Map。")
         st.stop()
 
+    heatmap_mode = st.radio(
+        "Heat Map 模式",
+        options=["自动推荐 Top 组合", "手动指定属性组合"],
+        horizontal=True,
+    )
+
     pair_options = list(combinations(selected_attrs, 2))
-    st.write(f"当前可生成 {len(pair_options)} 组属性组合。")
 
-    # 依据近7天指标总量，为用户优先展示更有价值的组合
-    pair_scores = []
-    for attr_x, attr_y in pair_options:
-        src = build_heatmap_source(merged_cur, attr_x, attr_y, metric_choice)
-        score = src["value"].sum() if len(src) else 0
-        pair_scores.append(((attr_x, attr_y), score))
+    display_pairs = []
+    if heatmap_mode == "自动推荐 Top 组合":
+        pair_scores = []
+        for attr_x, attr_y in pair_options:
+            src = build_heatmap_source(merged_cur, attr_x, attr_y, metric_choice)
+            score = src["value"].sum() if len(src) else 0
+            pair_scores.append(((attr_x, attr_y), score))
 
-    pair_scores = sorted(pair_scores, key=lambda x: x[1], reverse=True)
-    display_pairs = [p for p, _ in pair_scores[:max_pair_count]]
+        pair_scores = sorted(pair_scores, key=lambda x: x[1], reverse=True)
+        display_pairs = [p for p, _ in pair_scores[:max_pair_count]]
+
+        st.write(f"当前自动展示前 {len(display_pairs)} 组组合。")
+
+    else:
+        col_a, col_b = st.columns(2)
+        with col_a:
+            manual_x = st.selectbox("选择 X 轴属性", options=selected_attrs, key="manual_x")
+        with col_b:
+            manual_y_options = [x for x in selected_attrs if x != manual_x]
+            manual_y = st.selectbox("选择 Y 轴属性", options=manual_y_options, key="manual_y")
+
+        display_pairs = [(manual_x, manual_y)]
 
     for idx, (attr_x, attr_y) in enumerate(display_pairs, start=1):
         st.subheader(f"{idx}. {attr_x} × {attr_y}")
-        c1, c2 = st.columns(2)
 
         cur_src = build_heatmap_source(merged_cur, attr_x, attr_y, metric_choice)
         prev_src = build_heatmap_source(merged_prev, attr_x, attr_y, metric_choice)
 
-        with c1:
-            if len(cur_src) == 0:
-                st.info("近7天该组合没有数据")
-            else:
-                fig_cur = px.density_heatmap(
-                    cur_src,
-                    x=attr_x,
-                    y=attr_y,
-                    z="value",
-                    histfunc="sum",
-                    text_auto=True,
-                    title=f"近7天 - {metric_choice}",
-                )
-                fig_cur.update_layout(xaxis_title=attr_x, yaxis_title=attr_y)
-                st.plotly_chart(fig_cur, use_container_width=True)
+        cur_src_small = keep_top_labels(cur_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
+        prev_src_small = keep_top_labels(prev_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
 
-        with c2:
-            if len(prev_src) == 0:
-                st.info("过去7天该组合没有数据")
-            else:
-                fig_prev = px.density_heatmap(
-                    prev_src,
-                    x=attr_x,
-                    y=attr_y,
-                    z="value",
-                    histfunc="sum",
-                    text_auto=True,
-                    title=f"过去7天 - {metric_choice}",
-                )
-                fig_prev.update_layout(xaxis_title=attr_x, yaxis_title=attr_y)
-                st.plotly_chart(fig_prev, use_container_width=True)
-
-        # 差异热力图
-        all_src = cur_src.merge(
+        diff_src = cur_src.merge(
             prev_src,
-            on=[attr_y, attr_x],
+            on=[attr_x, attr_y],
             how="outer",
             suffixes=("_cur", "_prev"),
         ).fillna(0)
-        all_src["value_diff"] = all_src["value_cur"] - all_src["value_prev"]
+        diff_src["value"] = diff_src["value_cur"] - diff_src["value_prev"]
+        diff_src = diff_src[[attr_x, attr_y, "value"]]
+        diff_src_small = keep_top_labels(diff_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
 
-        st.markdown("**差异 Heat Map（近7天 - 过去7天）**")
-        if len(all_src) == 0:
-            st.info("该组合没有可比较数据")
-        else:
-            fig_diff = px.density_heatmap(
-                all_src,
-                x=attr_x,
-                y=attr_y,
-                z="value_diff",
-                histfunc="sum",
-                text_auto=True,
-                title=f"差异 - {metric_choice}",
+        tab1, tab2, tab3 = st.tabs(["近7天", "过去7天", "差异"])
+
+        with tab1:
+            render_heatmap(
+                cur_src_small,
+                attr_x=attr_x,
+                attr_y=attr_y,
+                value_col="value",
+                title=f"近7天 - {metric_choice}",
+                diff=False,
             )
-            fig_diff.update_layout(xaxis_title=attr_x, yaxis_title=attr_y)
-            st.plotly_chart(fig_diff, use_container_width=True)
+
+        with tab2:
+            render_heatmap(
+                prev_src_small,
+                attr_x=attr_x,
+                attr_y=attr_y,
+                value_col="value",
+                title=f"过去7天 - {metric_choice}",
+                diff=False,
+            )
+
+        with tab3:
+            render_heatmap(
+                diff_src_small,
+                attr_x=attr_x,
+                attr_y=attr_y,
+                value_col="value",
+                title=f"差异（近7天 - 过去7天）- {metric_choice}",
+                diff=True,
+            )
+
+        with st.expander(f"查看 {attr_x} × {attr_y} 原始明细表", expanded=False):
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                st.markdown("**近7天明细**")
+                st.dataframe(cur_src_small.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+
+            with col2:
+                st.markdown("**过去7天明细**")
+                st.dataframe(prev_src_small.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+
+            with col3:
+                st.markdown("**差异明细**")
+                st.dataframe(diff_src_small.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.header("明细数据导出")
+
     export_df = pd.concat([merged_cur, merged_prev], ignore_index=True)
     csv_bytes = export_df.to_csv(index=False).encode("utf-8-sig")
+
     st.download_button(
         label="下载映射后的明细 CSV",
         data=csv_bytes,
