@@ -13,12 +13,10 @@ except Exception:
 
 st.set_page_config(page_title="SKU 属性销售分析", layout="wide")
 
-st.title("SKU 属性销售分析仪表盘")
-st.caption(
-    "上传两个销售文件和一个 SKU 属性对照表后，自动完成 SKU 映射、动态时间区间识别、单属性分析、两两属性 Heat Map、退款风险分析、款均分析与中文摘要。"
-)
 
-
+# =========================
+# 基础工具函数
+# =========================
 def clean_text(x):
     if pd.isna(x):
         return np.nan
@@ -77,6 +75,200 @@ def format_pct(x):
     return f"{x * 100:.1f}%"
 
 
+def is_percent_metric(metric_name: str):
+    return metric_name in {
+        "refund_rate",
+        "refund_to_sales_ratio",
+        "refund_rate_by_orders",
+    }
+
+
+# =========================
+# 中文使用说明
+# =========================
+def render_user_guide():
+    with st.expander("中文使用说明", expanded=False):
+        st.markdown(
+            """
+### 这个工具是干什么的
+这个工具用于对比两个销售周期的数据，并结合 SKU 属性表，分析：
+
+- 哪些颜色 / 元素 / 风格 / 季节标签卖得更好
+- 哪些属性是因为铺款多，所以总销售额高
+- 哪些属性虽然铺款不多，但单款效率很强
+- 哪些属性更容易产生退款
+- 你的主观季节判断是否和真实销售结果一致
+
+---
+
+### 你需要上传 3 个文件
+左侧依次上传：
+
+- **当前对比文件（CSV）**：例如本周、本月、当前活动周期
+- **基准对比文件（CSV）**：例如上周、上月、上一活动周期
+- **SKU 属性对照表（CSV）**：包含 `SKU` 和各种属性字段
+
+---
+
+### 销售文件至少要有哪些列
+销售文件至少需要包含：
+
+- `Seller SKU`
+- `Quantity`
+
+如果有以下列，系统会自动识别并使用：
+
+- `SKU Subtotal After Discount`
+- `Order Amount`
+- `Order Refund Amount`
+- `Order Status`
+- 时间列（例如 `Order Created Time`）
+
+---
+
+### 属性表至少要有哪些列
+属性表至少需要有：
+
+- `SKU`
+
+推荐还包含：
+
+- Color
+- Design Elements
+- Season
+- Holiday
+- 上架时间
+- 你自己的主观企划字段（例如 `25C`、`26X`）
+
+---
+
+### 这个工具最重要的几个指标
+#### `sku_count`
+这个属性或属性组合下，一共有多少款。  
+适合看是不是靠铺款数堆出来的。
+
+#### `sales`
+总销售额。  
+适合看体量有多大。
+
+#### `sales_per_sku`
+款均销售额。  
+公式是：
+
+`总销售额 / SKU 数量`
+
+这个指标更适合判断哪些属性是真正“单款能打”。
+
+#### `refund_rate`
+退款订单占比。  
+更适合判断“哪个属性更容易退货”。
+
+#### `refund_to_sales_ratio`
+退款金额 / 销售额。  
+适合判断售后风险是否偏高。
+
+---
+
+### Heat Map 最推荐怎么读
+建议每次按下面顺序看：
+
+- 先看 `sku_count`
+- 再看 `sales`
+- 最后看 `sales_per_sku`
+
+这样你就能区分：
+
+- 是因为铺款多，所以总销售额高
+- 还是虽然款不多，但单款效率真的强
+
+如果你要分析售后风险，再重点看：
+
+- `refund_rate`
+- `refund_per_sku`
+- `refund_to_sales_ratio`
+
+---
+
+### 时间属性说明
+如果属性表里有 `上架时间`，系统会自动生成：
+
+- `上架月份`
+- `上架季度`
+- `上新阶段`
+
+其中：
+
+- 新品：0–30 天
+- 次新品：31–90 天
+- 常规款：91–180 天
+- 老款：180 天以上
+
+---
+
+### 主观企划属性 vs 客观时间属性
+如果你表里有类似：
+
+- `25C`
+- `26X`
+
+这类是**主观企划属性**。
+
+而：
+
+- 上架月份
+- 上架季度
+- 上新阶段
+
+属于**客观时间属性**。
+
+两者结合起来看，可以判断：
+
+- 你觉得它像春天/夏天的判断是否准确
+- 实际销售节奏是否与主观企划一致
+
+---
+
+### 页面里最值得看哪几块
+#### 单属性销售分析
+适合看某一个属性本身的表现，比如：
+
+- Color
+- Season
+- Holiday
+- 上架季度
+
+#### 两两属性 Heat Map
+适合看组合关系，比如：
+
+- Color × Design Elements
+- Season × Color
+- 上架季度 × Design Elements
+
+#### 退款风险专项分析
+适合专门看：
+
+- 哪些属性更容易退货
+- 哪些属性退款金额占比高
+- 哪些属性单款售后压力更大
+
+---
+
+### 实战建议
+如果你在分析一个属性，比如 Color：
+
+- 先看 `sales`：哪个颜色总盘子最大
+- 再看 `sku_count`：这个颜色是不是铺了很多款
+- 再看 `sales_per_sku`：这个颜色单款效率是否真的强
+- 最后看 `refund_rate`：这个颜色是不是更容易退货
+
+这样会比只看总销售额更合理。
+            """
+        )
+
+
+# =========================
+# 时间识别
+# =========================
 def detect_date_column(df):
     candidates = [
         "Order Created Time",
@@ -117,6 +309,9 @@ def build_period_label(dt_series, fallback_label):
     return label, start_dt, end_dt
 
 
+# =========================
+# 数据加载
+# =========================
 def load_sales(file, fallback_label: str):
     df = pd.read_csv(file)
     df.columns = [str(c).strip() for c in df.columns]
@@ -216,6 +411,9 @@ def load_attr(file):
     return attr
 
 
+# =========================
+# 预处理与聚合
+# =========================
 def merge_sales_attr(sales_df, attr_df):
     merged = sales_df.merge(attr_df, how="left", left_on="Base SKU", right_on="SKU")
     merged["Mapped"] = merged["SKU"].notna()
@@ -435,6 +633,9 @@ def sort_matrix(matrix):
     return matrix.loc[row_order, col_order]
 
 
+# =========================
+# 图表与表格
+# =========================
 def render_bar_chart(plot_df, x_col, title, y_label):
     if px is not None:
         fig = px.bar(
@@ -521,6 +722,8 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent
             height=max(420, 42 * len(matrix.index)),
             margin=dict(l=20, r=20, t=60, b=20),
         )
+        fig.update_xaxes(type="category")
+        fig.update_yaxes(type="category")
 
         st.plotly_chart(fig, use_container_width=True)
 
@@ -543,6 +746,49 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent
         st.caption("当前环境未安装 plotly，已自动切换为表格热力图。")
 
 
+def prepare_display_table(comp_df):
+    out = comp_df.copy()
+
+    pct_cols = [
+        "sales_pct", "units_pct", "order_lines_pct", "refund_pct", "refund_orders_pct",
+        "refund_rate_by_orders_cur", "refund_rate_by_orders_prev", "refund_rate_by_orders_diff", "refund_rate_by_orders_pct",
+        "refund_to_sales_ratio_cur", "refund_to_sales_ratio_prev", "refund_to_sales_ratio_diff", "refund_to_sales_ratio_pct",
+        "sales_per_sku_pct", "units_per_sku_pct", "refund_per_sku_pct", "order_lines_per_sku_pct",
+        "sku_count_pct",
+    ]
+
+    for col in pct_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "N/A")
+
+    money_cols = [
+        "sales_cur", "sales_prev", "sales_diff",
+        "refund_cur", "refund_prev", "refund_diff",
+        "sales_per_sku_cur", "sales_per_sku_prev", "sales_per_sku_diff",
+        "refund_per_sku_cur", "refund_per_sku_prev", "refund_per_sku_diff",
+    ]
+    for col in money_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: f"${x:,.2f}")
+
+    num_cols = [
+        "sku_count_cur", "sku_count_prev", "sku_count_diff",
+        "units_cur", "units_prev", "units_diff",
+        "order_lines_cur", "order_lines_prev", "order_lines_diff",
+        "refund_orders_cur", "refund_orders_prev", "refund_orders_diff",
+        "units_per_sku_cur", "units_per_sku_prev", "units_per_sku_diff",
+        "order_lines_per_sku_cur", "order_lines_per_sku_prev", "order_lines_per_sku_diff",
+    ]
+    for col in num_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+
+    return out
+
+
+# =========================
+# 文本解读
+# =========================
 def show_kpi_row(cur_df, prev_df, cur_label, prev_label):
     cur_sales = cur_df["Sales"].sum()
     prev_sales = prev_df["Sales"].sum()
@@ -740,45 +986,12 @@ def generate_business_suggestions(comp_df, attr_col, top_n=3):
     return texts
 
 
-def prepare_display_table(comp_df):
-    out = comp_df.copy()
-
-    pct_cols = [
-        "sales_pct", "units_pct", "order_lines_pct", "refund_pct", "refund_orders_pct",
-        "refund_rate_by_orders_cur", "refund_rate_by_orders_prev", "refund_rate_by_orders_diff", "refund_rate_by_orders_pct",
-        "refund_to_sales_ratio_cur", "refund_to_sales_ratio_prev", "refund_to_sales_ratio_diff", "refund_to_sales_ratio_pct",
-        "sales_per_sku_pct", "units_per_sku_pct", "refund_per_sku_pct", "order_lines_per_sku_pct",
-        "sku_count_pct",
-    ]
-
-    for col in pct_cols:
-        if col in out.columns:
-            out[col] = out[col].apply(lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "N/A")
-
-    money_cols = [
-        "sales_cur", "sales_prev", "sales_diff",
-        "refund_cur", "refund_prev", "refund_diff",
-        "sales_per_sku_cur", "sales_per_sku_prev", "sales_per_sku_diff",
-        "refund_per_sku_cur", "refund_per_sku_prev", "refund_per_sku_diff",
-    ]
-    for col in money_cols:
-        if col in out.columns:
-            out[col] = out[col].apply(lambda x: f"${x:,.2f}")
-
-    num_cols = [
-        "sku_count_cur", "sku_count_prev", "sku_count_diff",
-        "units_cur", "units_prev", "units_diff",
-        "order_lines_cur", "order_lines_prev", "order_lines_diff",
-        "refund_orders_cur", "refund_orders_prev", "refund_orders_diff",
-        "units_per_sku_cur", "units_per_sku_prev", "units_per_sku_diff",
-        "order_lines_per_sku_cur", "order_lines_per_sku_prev", "order_lines_per_sku_diff",
-    ]
-    for col in num_cols:
-        if col in out.columns:
-            out[col] = out[col].apply(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
-
-    return out
-
+# =========================
+# 页面
+# =========================
+st.title("SKU 属性销售分析仪表盘")
+st.caption("用于对比两个销售周期，并结合 SKU 属性表分析产品属性表现。")
+render_user_guide()
 
 st.sidebar.header("上传文件")
 current_file = st.sidebar.file_uploader("当前对比文件（CSV）", type=["csv"], key="current")
@@ -1034,7 +1247,7 @@ try:
         diff_src = diff_src[[attr_x, attr_y, "value"]]
         diff_src_small = keep_top_labels(diff_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
 
-        percent_metric = metric_choice in {"refund_rate", "refund_to_sales_ratio"}
+        percent_metric = is_percent_metric(metric_choice)
 
         tab1, tab2, tab3 = st.tabs([cur_label, prev_label, "差异"])
 
