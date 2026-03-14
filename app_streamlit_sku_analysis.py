@@ -381,7 +381,12 @@ def show_kpi_row(cur_df, prev_df):
     prev_map = prev_df["Mapped"].mean() if len(prev_df) else 0
 
     c1, c2, c3, c4 = st.columns(4)
-    c1.metric("近7天销售额", f"${cur_sales:,.2f}", f"${cur_sales - prev_sales:,.2f}")
+    c1.metric(
+    "近7天销售额",
+    f"${cur_sales:,.2f}",
+    f"${cur_sales - prev_sales:,.2f}",
+    delta_color="normal"
+)
     c2.metric("近7天销量", f"{cur_units:,.0f}", f"{cur_units - prev_units:,.0f}")
     c3.metric("近7天订单行", f"{cur_lines:,}", f"{cur_lines - prev_lines:,}")
     c4.metric("SKU映射率", f"{cur_map:.1%}", f"{(cur_map - prev_map):.1%}")
