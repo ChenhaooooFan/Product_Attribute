@@ -233,7 +233,7 @@ def choose_attribute_columns(df):
         "Seller SKU",
         "Base SKU",
         "Period",
-        "Mapped"
+        "Mapped",
     }
 
     candidates = []
@@ -280,7 +280,7 @@ def aggregate_by_attribute(df, attr_col):
         sales=("Sales", "sum"),
         refund=("Refund Amount", "sum"),
         refund_orders=("Has Refund", "sum"),
-        sku_count=("Base SKU", "nunique")
+        sku_count=("Base SKU", "nunique"),
     ).reset_index().rename(columns={"_attr_item": attr_col})
 
     g["refund_rate_by_orders"] = np.where(g["order_lines"] == 0, np.nan, g["refund_orders"] / g["order_lines"])
@@ -331,7 +331,7 @@ def compare_periods(cur_df, prev_df, attr_col):
         "order_lines", "units", "sales", "refund", "refund_orders",
         "refund_rate_by_orders", "refund_to_sales_ratio",
         "sales_per_sku", "units_per_sku", "refund_per_sku", "order_lines_per_sku",
-        "sku_count"
+        "sku_count",
     ]
 
     for metric in metrics:
@@ -339,7 +339,7 @@ def compare_periods(cur_df, prev_df, attr_col):
         merged[f"{metric}_pct"] = np.where(
             merged[f"{metric}_prev"] == 0,
             np.nan,
-            merged[f"{metric}_diff"] / merged[f"{metric}_prev"]
+            merged[f"{metric}_diff"] / merged[f"{metric}_prev"],
         )
 
     return merged.sort_values("sales_cur", ascending=False)
@@ -366,7 +366,7 @@ def build_heatmap_source(df, attr_x, attr_y, metric):
         order_lines=("Seller SKU", "count"),
         refund=("Refund Amount", "sum"),
         refund_orders=("Has Refund", "sum"),
-        sku_count=("Base SKU", "nunique")
+        sku_count=("Base SKU", "nunique"),
     ).reset_index()
 
     grp["refund_rate"] = np.where(grp["order_lines"] == 0, np.nan, grp["refund_orders"] / grp["order_lines"])
@@ -378,6 +378,7 @@ def build_heatmap_source(df, attr_x, attr_y, metric):
     grp["order_lines_per_sku"] = np.where(grp["sku_count"] == 0, np.nan, grp["order_lines"] / grp["sku_count"])
 
     metric_map = {
+        "sku_count": "sku_count",
         "sales": "sales",
         "sales_per_sku": "sales_per_sku",
         "units": "units",
@@ -396,7 +397,7 @@ def build_heatmap_source(df, attr_x, attr_y, metric):
     src = src.rename(columns={
         "_x_items": attr_x,
         "_y_items": attr_y,
-        value_col: "value"
+        value_col: "value",
     })
     return src
 
@@ -509,7 +510,7 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent
             text=text_matrix.values,
             texttemplate="%{text}",
             textfont_size=12,
-            hovertemplate=f"{attr_y}: %{{y}}<br>{attr_x}: %{{x}}<br>值: %{{z}}<extra></extra>"
+            hovertemplate=f"{attr_y}: %{{y}}<br>{attr_x}: %{{x}}<br>值: %{{z}}<extra></extra>",
         )
 
         fig.update_layout(
@@ -616,23 +617,8 @@ def generate_overall_summary(cur_df, prev_df, cur_label, prev_label):
         f"{cur_label} 订单行数为 {cur_lines:,}，相较 {prev_label} 变化了 {lines_diff:,}，变化幅度为 {format_pct(lines_pct)}。",
         f"{cur_label} 退款金额为 ${cur_refund:,.2f}，相较 {prev_label} 变化了 ${refund_diff:,.2f}，变化幅度为 {format_pct(refund_pct)}。",
         f"{cur_label} 发生退款的订单行数为 {cur_refund_orders:,.0f}，相较 {prev_label} 变化了 {refund_orders_diff:,.0f}，变化幅度为 {format_pct(refund_orders_pct)}。",
-        f"当前 SKU 属性映射率为 {cur_map:.1%}。"
+        f"当前 SKU 属性映射率为 {cur_map:.1%}。",
     ]
-
-    if sales_diff > 0 and units_diff > 0:
-        texts.append("这说明当前区间整体销售表现偏强，销售额和销量同步改善。")
-    elif sales_diff > 0 and units_diff <= 0:
-        texts.append("这说明当前区间销售额提升更多可能来自高客单价款式，而不是纯粹靠销量扩大。")
-    elif sales_diff < 0 and units_diff < 0:
-        texts.append("这说明当前区间整体成交表现走弱，建议进一步拆解属性结构和主力 SKU 的变化。")
-    else:
-        texts.append("当前区间销售额与销量的变化方向并不完全一致，建议结合属性和退款表现做进一步分析。")
-
-    if refund_diff > 0:
-        texts.append("退款金额上升意味着当前区间售后压力有所变大，建议重点观察哪些属性和组合更容易产生退款。")
-    elif refund_diff < 0:
-        texts.append("退款金额下降说明当前区间售后表现有所改善，可以继续观察改善是否来自某些属性组合结构优化。")
-
     return texts
 
 
@@ -653,7 +639,7 @@ def generate_attribute_summary(comp_df, attr_col, top_n=5):
 
     if len(top_sales_per_sku) > 0:
         names = "、".join(top_sales_per_sku[attr_col].astype(str).tolist())
-        texts.append(f"从款均销售额来看，单款效率最高的 {attr_col} 属性词主要包括：{names}。这组指标更适合判断哪些属性是真正“单款能打”。")
+        texts.append(f"从款均销售额来看，单款效率最高的 {attr_col} 属性词主要包括：{names}。这更适合判断哪些属性是真正单款能打。")
 
     if len(top_growth) > 0:
         names = "、".join(top_growth[attr_col].astype(str).tolist())
@@ -762,7 +748,7 @@ def prepare_display_table(comp_df):
         "refund_rate_by_orders_cur", "refund_rate_by_orders_prev", "refund_rate_by_orders_diff", "refund_rate_by_orders_pct",
         "refund_to_sales_ratio_cur", "refund_to_sales_ratio_prev", "refund_to_sales_ratio_diff", "refund_to_sales_ratio_pct",
         "sales_per_sku_pct", "units_per_sku_pct", "refund_per_sku_pct", "order_lines_per_sku_pct",
-        "sku_count_pct"
+        "sku_count_pct",
     ]
 
     for col in pct_cols:
@@ -780,10 +766,10 @@ def prepare_display_table(comp_df):
             out[col] = out[col].apply(lambda x: f"${x:,.2f}")
 
     num_cols = [
+        "sku_count_cur", "sku_count_prev", "sku_count_diff",
         "units_cur", "units_prev", "units_diff",
         "order_lines_cur", "order_lines_prev", "order_lines_diff",
         "refund_orders_cur", "refund_orders_prev", "refund_orders_diff",
-        "sku_count_cur", "sku_count_prev", "sku_count_diff",
         "units_per_sku_cur", "units_per_sku_prev", "units_per_sku_diff",
         "order_lines_per_sku_cur", "order_lines_per_sku_prev", "order_lines_per_sku_diff",
     ]
@@ -805,12 +791,12 @@ selected_status = st.sidebar.multiselect(
     options=["Shipped", "Completed", "To ship", "Canceled", "Unknown"],
     default=["Shipped", "Completed"],
 )
-
 mapped_only = st.sidebar.checkbox("只分析成功映射属性的记录", value=True)
 
 metric_choice = st.sidebar.selectbox(
     "Heat Map 指标",
     options=[
+        "sku_count",
         "sales",
         "sales_per_sku",
         "units",
@@ -823,12 +809,15 @@ metric_choice = st.sidebar.selectbox(
         "refund_rate",
         "refund_to_sales_ratio",
     ],
-    index=0,
+    index=1,
 )
 
 max_pair_count = st.sidebar.slider("自动模式最多展示多少组属性组合", min_value=1, max_value=15, value=6)
 heatmap_top_n = st.sidebar.slider("Heat Map 每轴最多保留多少个属性词", min_value=5, max_value=30, value=12)
 top_summary_n = st.sidebar.slider("自动摘要最多引用多少个属性/组合", min_value=3, max_value=10, value=5)
+
+show_text_summary = st.sidebar.checkbox("显示文字解读", value=True)
+show_top_notice = st.sidebar.checkbox("显示顶部说明", value=True)
 
 if not (current_file and previous_file and attr_file):
     st.info("请先在左侧上传 3 个 CSV 文件。")
@@ -866,19 +855,20 @@ try:
 
     show_kpi_row(merged_cur, merged_prev, cur_label, prev_label)
 
-    st.info(f"当前对比区间：{cur_label} vs {prev_label}")
+    if show_top_notice:
+        st.info(f"当前对比区间：{cur_label} vs {prev_label}")
+        st.info(
+            "说明：当前分析中，“上架月份 / 上架季度 / 上新阶段”属于根据上架时间自动生成的客观时间属性；"
+            "而你表中原有的季节字段（例如 25C、26X 等）属于主观企划属性。"
+            "两者可以配合使用，用来判断你的季节判断是否和实际销售节奏一致。"
+        )
 
-    st.info(
-        "说明：当前分析中，“上架月份 / 上架季度 / 上新阶段”属于根据上架时间自动生成的客观时间属性；"
-        "而你表中原有的季节字段（例如 25C、26X 等）属于主观企划属性。"
-        "两者可以配合使用，用来判断你的季节判断是否和实际销售节奏一致。"
-    )
-
-    st.markdown("---")
-    st.header("自动分析摘要")
-    overall_texts = generate_overall_summary(merged_cur, merged_prev, cur_label, prev_label)
-    for t in overall_texts:
-        st.write("• " + t)
+    if show_text_summary:
+        st.markdown("---")
+        st.header("自动分析摘要")
+        overall_texts = generate_overall_summary(merged_cur, merged_prev, cur_label, prev_label)
+        for t in overall_texts:
+            st.write("• " + t)
 
     with st.expander("映射质量检查", expanded=False):
         col1, col2 = st.columns(2)
@@ -907,7 +897,6 @@ try:
     st.header("单属性销售分析")
 
     focus_attr = st.selectbox("选择一个属性看区间对比", options=selected_attrs)
-
     comp_df = compare_periods(merged_cur, merged_prev, focus_attr)
 
     display_cols = [
@@ -935,20 +924,21 @@ try:
     comp_df_display = prepare_display_table(comp_df[display_cols].copy())
     st.dataframe(comp_df_display, use_container_width=True, hide_index=True)
 
-    st.markdown("#### 单属性分析解读")
-    attr_texts = generate_attribute_summary(comp_df, focus_attr, top_n=top_summary_n)
-    for t in attr_texts:
-        st.write("• " + t)
+    if show_text_summary:
+        st.markdown("#### 单属性分析解读")
+        attr_texts = generate_attribute_summary(comp_df, focus_attr, top_n=top_summary_n)
+        for t in attr_texts:
+            st.write("• " + t)
 
-    st.markdown("#### 退款分析解读")
-    refund_texts = generate_refund_summary(comp_df, focus_attr, top_n=top_summary_n)
-    for t in refund_texts:
-        st.write("• " + t)
+        st.markdown("#### 退款分析解读")
+        refund_texts = generate_refund_summary(comp_df, focus_attr, top_n=top_summary_n)
+        for t in refund_texts:
+            st.write("• " + t)
 
-    st.markdown("#### 单属性业务建议")
-    suggestion_texts = generate_business_suggestions(comp_df, focus_attr, top_n=3)
-    for t in suggestion_texts:
-        st.write("• " + t)
+        st.markdown("#### 单属性业务建议")
+        suggestion_texts = generate_business_suggestions(comp_df, focus_attr, top_n=3)
+        for t in suggestion_texts:
+            st.write("• " + t)
 
     chart_metric = st.radio(
         "单属性柱状图指标",
@@ -963,7 +953,7 @@ try:
             "refund_per_sku",
             "refund_orders",
             "refund_rate_by_orders",
-            "refund_to_sales_ratio"
+            "refund_to_sales_ratio",
         ],
         horizontal=True,
         index=0,
@@ -1025,10 +1015,11 @@ try:
         cur_src = build_heatmap_source(merged_cur, attr_x, attr_y, metric_choice)
         prev_src = build_heatmap_source(merged_prev, attr_x, attr_y, metric_choice)
 
-        heatmap_texts = generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, metric_choice, top_n=top_summary_n)
-        st.markdown("#### 组合分析解读")
-        for t in heatmap_texts:
-            st.write("• " + t)
+        if show_text_summary:
+            heatmap_texts = generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, metric_choice, top_n=top_summary_n)
+            st.markdown("#### 组合分析解读")
+            for t in heatmap_texts:
+                st.write("• " + t)
 
         cur_src_small = keep_top_labels(cur_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
         prev_src_small = keep_top_labels(prev_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
@@ -1159,7 +1150,7 @@ try:
         st.dataframe(
             top_refund_amt[[refund_attr, "refund_cur", "sales_cur"]].assign(
                 refund_cur=lambda d: d["refund_cur"].map(lambda x: f"${x:,.2f}"),
-                sales_cur=lambda d: d["sales_cur"].map(lambda x: f"${x:,.2f}")
+                sales_cur=lambda d: d["sales_cur"].map(lambda x: f"${x:,.2f}"),
             ),
             use_container_width=True,
             hide_index=True,
@@ -1171,7 +1162,7 @@ try:
             top_refund_rate[[refund_attr, "refund_rate_by_orders_cur", "refund_orders_cur", "order_lines_cur"]].assign(
                 refund_rate_by_orders_cur=lambda d: d["refund_rate_by_orders_cur"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A"),
                 refund_orders_cur=lambda d: d["refund_orders_cur"].map(lambda x: f"{x:,.0f}"),
-                order_lines_cur=lambda d: d["order_lines_cur"].map(lambda x: f"{x:,.0f}")
+                order_lines_cur=lambda d: d["order_lines_cur"].map(lambda x: f"{x:,.0f}"),
             ),
             use_container_width=True,
             hide_index=True,
@@ -1183,7 +1174,7 @@ try:
             top_refund_ratio[[refund_attr, "refund_to_sales_ratio_cur", "refund_cur", "sales_cur"]].assign(
                 refund_to_sales_ratio_cur=lambda d: d["refund_to_sales_ratio_cur"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A"),
                 refund_cur=lambda d: d["refund_cur"].map(lambda x: f"${x:,.2f}"),
-                sales_cur=lambda d: d["sales_cur"].map(lambda x: f"${x:,.2f}")
+                sales_cur=lambda d: d["sales_cur"].map(lambda x: f"${x:,.2f}"),
             ),
             use_container_width=True,
             hide_index=True,
@@ -1194,7 +1185,7 @@ try:
         st.dataframe(
             top_refund_per_sku[[refund_attr, "refund_per_sku_cur", "sku_count_cur"]].assign(
                 refund_per_sku_cur=lambda d: d["refund_per_sku_cur"].map(lambda x: f"${x:,.2f}"),
-                sku_count_cur=lambda d: d["sku_count_cur"].map(lambda x: f"{x:,.0f}")
+                sku_count_cur=lambda d: d["sku_count_cur"].map(lambda x: f"{x:,.0f}"),
             ),
             use_container_width=True,
             hide_index=True,
