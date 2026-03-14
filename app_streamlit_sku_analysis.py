@@ -15,7 +15,7 @@ st.set_page_config(page_title="SKU 属性销售分析", layout="wide")
 
 st.title("SKU 属性销售分析仪表盘")
 st.caption(
-    "上传近7天销售数据、过去7天销售数据、SKU属性对照表后，自动完成 SKU 映射、单属性分析、两两属性 Heat Map 分析，并生成中文摘要。"
+    "上传两个销售文件和一个 SKU 属性对照表后，自动完成 SKU 映射、动态时间区间识别、单属性分析、两两属性 Heat Map、退款风险分析与中文摘要。"
 )
 
 
@@ -77,14 +77,54 @@ def format_pct(x):
     return f"{x * 100:.1f}%"
 
 
-def load_sales(file, label: str):
+def detect_date_column(df):
+    candidates = [
+        "Order Created Time",
+        "Order Create Time",
+        "Created Time",
+        "Create Time",
+        "Order Date",
+        "Created At",
+        "order_created_time",
+        "create_time",
+        "date",
+    ]
+
+    for col in candidates:
+        if col in df.columns:
+            dt = pd.to_datetime(df[col], errors="coerce")
+            if dt.notna().sum() > 0:
+                return col
+
+    for col in df.columns:
+        col_name = str(col).lower()
+        if "date" in col_name or "time" in col_name:
+            dt = pd.to_datetime(df[col], errors="coerce")
+            if dt.notna().sum() > 0:
+                return col
+
+    return None
+
+
+def build_period_label(dt_series, fallback_label):
+    dt_series = pd.to_datetime(dt_series, errors="coerce").dropna()
+    if len(dt_series) == 0:
+        return fallback_label, None, None
+
+    start_dt = dt_series.min().normalize()
+    end_dt = dt_series.max().normalize()
+    label = f"{start_dt.strftime('%Y-%m-%d')} ~ {end_dt.strftime('%Y-%m-%d')}"
+    return label, start_dt, end_dt
+
+
+def load_sales(file, fallback_label: str):
     df = pd.read_csv(file)
     df.columns = [str(c).strip() for c in df.columns]
 
     required_cols = ["Seller SKU", "Quantity"]
     missing = [c for c in required_cols if c not in df.columns]
     if missing:
-        raise ValueError(f"{label} 缺少必要列: {missing}")
+        raise ValueError(f"{fallback_label} 缺少必要列: {missing}")
 
     df["Seller SKU"] = df["Seller SKU"].astype(str).str.strip()
     df["Base SKU"] = df["Seller SKU"].apply(normalize_base_sku)
@@ -106,7 +146,21 @@ def load_sales(file, label: str):
         df["Order Status"] = "Unknown"
 
     df["Has Refund"] = np.where(df["Refund Amount"] > 0, 1, 0)
-    df["Period"] = label
+
+    date_col = detect_date_column(df)
+    if date_col is not None:
+        df["Order Date Parsed"] = pd.to_datetime(df[date_col], errors="coerce")
+        period_label, period_start, period_end = build_period_label(df["Order Date Parsed"], fallback_label)
+    else:
+        df["Order Date Parsed"] = pd.NaT
+        period_label, period_start, period_end = fallback_label, None, None
+
+    df["Period"] = period_label
+    df.attrs["period_label"] = period_label
+    df.attrs["period_start"] = period_start
+    df.attrs["period_end"] = period_end
+    df.attrs["date_col"] = date_col
+
     return df
 
 
@@ -392,28 +446,39 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent
 
     st.markdown(f"**{title}**")
 
+    def format_cell(v):
+        if pd.isna(v):
+            return ""
+        if percent:
+            return "0%" if abs(v) < 1e-12 else f"{v:.1%}"
+        return "0" if abs(v) < 1e-12 else f"{v:,.2f}"
+
+    text_matrix = matrix.copy().applymap(format_cell)
+
     if px is not None:
+        plot_matrix = matrix.copy()
+
         if diff:
-            max_abs = float(np.nanmax(np.abs(matrix.values))) if matrix.size else 0.0
+            max_abs = float(np.nanmax(np.abs(plot_matrix.values))) if plot_matrix.size else 0.0
             if max_abs == 0 or np.isnan(max_abs):
                 max_abs = 1.0
 
             fig = px.imshow(
-                matrix,
-                text_auto=".1%" if percent else True,
+                plot_matrix,
                 aspect="auto",
                 color_continuous_scale="RdYlGn",
                 range_color=[-max_abs, max_abs],
             )
         else:
             fig = px.imshow(
-                matrix,
-                text_auto=".1%" if percent else True,
+                plot_matrix,
                 aspect="auto",
                 color_continuous_scale="YlOrRd",
             )
 
         fig.update_traces(
+            text=text_matrix.values,
+            texttemplate="%{text}",
             textfont_size=12,
             hovertemplate=f"{attr_y}: %{{y}}<br>{attr_x}: %{{x}}<br>值: %{{z}}<extra></extra>"
         )
@@ -428,11 +493,12 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent
         )
 
         st.plotly_chart(fig, use_container_width=True)
+
     else:
         if percent:
-            styled = matrix.style.format("{:.1%}")
+            styled = matrix.style.format(lambda v: "" if pd.isna(v) else ("0%" if abs(v) < 1e-12 else f"{v:.1%}"))
         else:
-            styled = matrix.style.format("{:.2f}")
+            styled = matrix.style.format(lambda v: "" if pd.isna(v) else ("0" if abs(v) < 1e-12 else f"{v:,.2f}"))
 
         if diff:
             styled = styled.background_gradient(cmap="RdYlGn", axis=None)
@@ -443,7 +509,7 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent
         st.caption("当前环境未安装 plotly，已自动切换为表格热力图。")
 
 
-def show_kpi_row(cur_df, prev_df):
+def show_kpi_row(cur_df, prev_df, cur_label, prev_label):
     cur_sales = cur_df["Sales"].sum()
     prev_sales = prev_df["Sales"].sum()
 
@@ -458,19 +524,19 @@ def show_kpi_row(cur_df, prev_df):
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
-        "近7天销售额",
+        f"{cur_label} 销售额",
         f"${cur_sales:,.2f}",
         f"${cur_sales - prev_sales:,.2f}",
         delta_color="normal",
     )
     c2.metric(
-        "近7天销量",
+        f"{cur_label} 销量",
         f"{cur_units:,.0f}",
         f"{cur_units - prev_units:,.0f}",
         delta_color="normal",
     )
     c3.metric(
-        "近7天订单行",
+        f"{cur_label} 订单行",
         f"{cur_lines:,}",
         f"{cur_lines - prev_lines:,}",
         delta_color="normal",
@@ -483,7 +549,7 @@ def show_kpi_row(cur_df, prev_df):
     )
 
 
-def generate_overall_summary(cur_df, prev_df):
+def generate_overall_summary(cur_df, prev_df, cur_label, prev_label):
     cur_sales = cur_df["Sales"].sum()
     prev_sales = prev_df["Sales"].sum()
     cur_units = cur_df["Quantity"].sum()
@@ -512,27 +578,27 @@ def generate_overall_summary(cur_df, prev_df):
     cur_map = cur_df["Mapped"].mean() if len(cur_df) else 0
 
     texts = [
-        f"近 7 天整体销售额为 ${cur_sales:,.2f}，相比过去 7 天变化了 ${sales_diff:,.2f}，变化幅度为 {format_pct(sales_pct)}。",
-        f"近 7 天总销量为 {cur_units:,.0f} 件，相比过去 7 天变化了 {units_diff:,.0f} 件，变化幅度为 {format_pct(units_pct)}。",
-        f"近 7 天订单行数为 {cur_lines:,}，相比过去 7 天变化了 {lines_diff:,}，变化幅度为 {format_pct(lines_pct)}。",
-        f"近 7 天退款金额为 ${cur_refund:,.2f}，相比过去 7 天变化了 ${refund_diff:,.2f}，变化幅度为 {format_pct(refund_pct)}。",
-        f"近 7 天发生退款的订单行数为 {cur_refund_orders:,.0f}，相比过去 7 天变化了 {refund_orders_diff:,.0f}，变化幅度为 {format_pct(refund_orders_pct)}。",
-        f"当前 SKU 属性映射率为 {cur_map:.1%}，说明本次属性分析对整体样本的覆盖度{'较高' if cur_map >= 0.85 else '中等' if cur_map >= 0.6 else '偏低'}。"
+        f"{cur_label} 整体销售额为 ${cur_sales:,.2f}，相较 {prev_label} 变化了 ${sales_diff:,.2f}，变化幅度为 {format_pct(sales_pct)}。",
+        f"{cur_label} 总销量为 {cur_units:,.0f} 件，相较 {prev_label} 变化了 {units_diff:,.0f} 件，变化幅度为 {format_pct(units_pct)}。",
+        f"{cur_label} 订单行数为 {cur_lines:,}，相较 {prev_label} 变化了 {lines_diff:,}，变化幅度为 {format_pct(lines_pct)}。",
+        f"{cur_label} 退款金额为 ${cur_refund:,.2f}，相较 {prev_label} 变化了 ${refund_diff:,.2f}，变化幅度为 {format_pct(refund_pct)}。",
+        f"{cur_label} 发生退款的订单行数为 {cur_refund_orders:,.0f}，相较 {prev_label} 变化了 {refund_orders_diff:,.0f}，变化幅度为 {format_pct(refund_orders_pct)}。",
+        f"当前 SKU 属性映射率为 {cur_map:.1%}。"
     ]
 
     if sales_diff > 0 and units_diff > 0:
-        texts.append("这说明本周整体销售表现偏强，销售额和销量同步改善。")
+        texts.append("这说明当前区间整体销售表现偏强，销售额和销量同步改善。")
     elif sales_diff > 0 and units_diff <= 0:
-        texts.append("这说明本周销售额提升更多可能来自高客单价款式，而不是纯粹靠销量扩大。")
+        texts.append("这说明当前区间销售额提升更多可能来自高客单价款式，而不是纯粹靠销量扩大。")
     elif sales_diff < 0 and units_diff < 0:
-        texts.append("这说明本周整体成交表现走弱，建议进一步拆解属性结构和主力 SKU 的变化。")
+        texts.append("这说明当前区间整体成交表现走弱，建议进一步拆解属性结构和主力 SKU 的变化。")
     else:
-        texts.append("本周销售额与销量的变化方向并不完全一致，建议结合属性和退款表现做进一步分析。")
+        texts.append("当前区间销售额与销量的变化方向并不完全一致，建议结合属性和退款表现做进一步分析。")
 
     if refund_diff > 0:
-        texts.append("退款金额上升意味着本周售后压力有所变大，建议重点观察哪些属性和组合更容易产生退款。")
+        texts.append("退款金额上升意味着当前区间售后压力有所变大，建议重点观察哪些属性和组合更容易产生退款。")
     elif refund_diff < 0:
-        texts.append("退款金额下降说明本周售后表现有所改善，可以继续观察改善是否来自某些属性组合结构优化。")
+        texts.append("退款金额下降说明当前区间售后表现有所改善，可以继续观察改善是否来自某些属性组合结构优化。")
 
     return texts
 
@@ -555,11 +621,11 @@ def generate_attribute_summary(comp_df, attr_col, metric="sales", top_n=5):
 
     if len(top_cur) > 0:
         top_names = "、".join(top_cur[attr_col].astype(str).tolist())
-        texts.append(f"从 {attr_col} 维度来看，近 7 天贡献最高的属性词主要包括：{top_names}。这些属性词构成了当前阶段最核心的销售贡献来源。")
+        texts.append(f"从 {attr_col} 维度来看，当前区间贡献最高的属性词主要包括：{top_names}。这些属性词构成了当前阶段最核心的销售贡献来源。")
 
     if len(top_growth) > 0:
         growth_names = "、".join(top_growth[attr_col].astype(str).tolist())
-        texts.append(f"从环比增长角度看，提升最明显的属性词包括：{growth_names}。这些属性在近 7 天相较过去 7 天获得了更强的市场反馈。")
+        texts.append(f"从环比增长角度看，提升最明显的属性词包括：{growth_names}。这些属性相较对比区间获得了更强的市场反馈。")
 
     if len(top_decline) > 0:
         decline_names = "、".join(top_decline[attr_col].astype(str).tolist())
@@ -568,7 +634,7 @@ def generate_attribute_summary(comp_df, attr_col, metric="sales", top_n=5):
     leader = top_cur.iloc[0] if len(top_cur) > 0 else None
     if leader is not None:
         texts.append(
-            f"其中，{leader[attr_col]} 在近 7 天的销售额为 ${leader['sales_cur']:,.2f}，销量为 {leader['units_cur']:,.0f}，退款金额为 ${leader['refund_cur']:,.2f}，说明它既是主力成交属性，也值得同步关注其售后表现。"
+            f"其中，{leader[attr_col]} 在当前区间的销售额为 ${leader['sales_cur']:,.2f}，销量为 {leader['units_cur']:,.0f}，退款金额为 ${leader['refund_cur']:,.2f}，说明它既是主力成交属性，也值得同步关注其售后表现。"
         )
 
     return texts
@@ -587,7 +653,7 @@ def generate_refund_summary(comp_df, attr_col, top_n=5):
 
     if len(high_refund_amt) > 0:
         names = "、".join(high_refund_amt[attr_col].astype(str).tolist())
-        texts.append(f"从退款金额来看，近 7 天退款金额较高的属性词主要包括：{names}。这些属性对应的售后金额压力更大。")
+        texts.append(f"从退款金额来看，当前区间退款金额较高的属性词主要包括：{names}。这些属性对应的售后金额压力更大。")
 
     if len(high_refund_rate) > 0:
         names = "、".join(high_refund_rate[attr_col].astype(str).tolist())
@@ -621,11 +687,11 @@ def generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, top_n=5):
 
     if len(cur_top) > 0:
         combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in cur_top.iterrows()]
-        texts.append(f"从 {attr_x} × {attr_y} 的组合关系来看，近 7 天表现最强的组合主要有：{'、'.join(combos)}。这些组合是当前销售贡献最集中的核心搭配。")
+        texts.append(f"从 {attr_x} × {attr_y} 的组合关系来看，当前区间表现最强的组合主要有：{'、'.join(combos)}。这些组合是当前销售贡献最集中的核心搭配。")
 
     if len(growth_top) > 0:
         combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in growth_top.iterrows()]
-        texts.append(f"从周环比变化来看，增长最明显的组合包括：{'、'.join(combos)}。说明这些属性搭配在当前周期内更容易获得用户认可。")
+        texts.append(f"从区间对比变化来看，增长最明显的组合包括：{'、'.join(combos)}。说明这些属性搭配在当前周期内更容易获得用户认可。")
 
     if len(decline_top) > 0:
         combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in decline_top.iterrows()]
@@ -702,8 +768,8 @@ def prepare_display_table(comp_df):
 
 
 st.sidebar.header("上传文件")
-current_file = st.sidebar.file_uploader("近 7 天销售数据（CSV）", type=["csv"], key="current")
-previous_file = st.sidebar.file_uploader("过去 7 天销售数据（CSV）", type=["csv"], key="previous")
+current_file = st.sidebar.file_uploader("当前对比文件（CSV）", type=["csv"], key="current")
+previous_file = st.sidebar.file_uploader("基准对比文件（CSV）", type=["csv"], key="previous")
 attr_file = st.sidebar.file_uploader("SKU 属性对照表（CSV）", type=["csv"], key="attr")
 
 st.sidebar.header("分析设置")
@@ -738,8 +804,12 @@ if not (current_file and previous_file and attr_file):
     st.stop()
 
 try:
-    sales_cur = load_sales(current_file, "近7天")
-    sales_prev = load_sales(previous_file, "过去7天")
+    sales_cur = load_sales(current_file, "当前文件")
+    sales_prev = load_sales(previous_file, "对比文件")
+
+    cur_label = sales_cur.attrs.get("period_label", "当前文件")
+    prev_label = sales_prev.attrs.get("period_label", "对比文件")
+
     attr_df = load_attr(attr_file)
 
     merged_cur = merge_sales_attr(sales_cur, attr_df)
@@ -763,7 +833,9 @@ try:
         st.warning("请至少选择 1 个属性列。")
         st.stop()
 
-    show_kpi_row(merged_cur, merged_prev)
+    show_kpi_row(merged_cur, merged_prev, cur_label, prev_label)
+
+    st.info(f"当前对比区间：{cur_label} vs {prev_label}")
 
     st.info(
         "说明：当前分析中，“上架月份 / 上架季度 / 上新阶段”属于根据上架时间自动生成的客观时间属性；"
@@ -773,7 +845,7 @@ try:
 
     st.markdown("---")
     st.header("自动分析摘要")
-    overall_texts = generate_overall_summary(merged_cur, merged_prev)
+    overall_texts = generate_overall_summary(merged_cur, merged_prev, cur_label, prev_label)
     for t in overall_texts:
         st.write("• " + t)
 
@@ -781,7 +853,7 @@ try:
         col1, col2 = st.columns(2)
 
         with col1:
-            st.subheader("近7天未映射 SKU")
+            st.subheader(f"{cur_label} 未映射 SKU")
             unmapped_cur = (
                 merged_cur.loc[~merged_cur["Mapped"], ["Seller SKU", "Base SKU"]]
                 .value_counts()
@@ -791,7 +863,7 @@ try:
             st.dataframe(unmapped_cur, use_container_width=True, hide_index=True)
 
         with col2:
-            st.subheader("过去7天未映射 SKU")
+            st.subheader(f"{prev_label} 未映射 SKU")
             unmapped_prev = (
                 merged_prev.loc[~merged_prev["Mapped"], ["Seller SKU", "Base SKU"]]
                 .value_counts()
@@ -803,7 +875,7 @@ try:
     st.markdown("---")
     st.header("单属性销售分析")
 
-    focus_attr = st.selectbox("选择一个属性看周对比", options=selected_attrs)
+    focus_attr = st.selectbox("选择一个属性看区间对比", options=selected_attrs)
 
     comp_df = compare_periods(merged_cur, merged_prev, focus_attr)
 
@@ -847,14 +919,14 @@ try:
     plot_df = comp_df[[focus_attr, f"{chart_metric}_cur", f"{chart_metric}_prev"]].copy()
     plot_df = plot_df.melt(id_vars=[focus_attr], var_name="period", value_name="value")
     plot_df["period"] = plot_df["period"].map({
-        f"{chart_metric}_cur": "近7天",
-        f"{chart_metric}_prev": "过去7天",
+        f"{chart_metric}_cur": cur_label,
+        f"{chart_metric}_prev": prev_label,
     })
 
     render_bar_chart(
         plot_df=plot_df,
         x_col=focus_attr,
-        title=f"{focus_attr} - 近7天 vs 过去7天",
+        title=f"{focus_attr} - {cur_label} vs {prev_label}",
         y_label=chart_metric,
     )
 
@@ -920,7 +992,7 @@ try:
 
         percent_metric = metric_choice in {"refund_rate", "refund_to_sales_ratio"}
 
-        tab1, tab2, tab3 = st.tabs(["近7天", "过去7天", "差异"])
+        tab1, tab2, tab3 = st.tabs([cur_label, prev_label, "差异"])
 
         with tab1:
             render_heatmap(
@@ -928,7 +1000,7 @@ try:
                 attr_x=attr_x,
                 attr_y=attr_y,
                 value_col="value",
-                title=f"近7天 - {metric_choice}",
+                title=f"{cur_label} - {metric_choice}",
                 diff=False,
                 percent=percent_metric,
             )
@@ -939,7 +1011,7 @@ try:
                 attr_x=attr_x,
                 attr_y=attr_y,
                 value_col="value",
-                title=f"过去7天 - {metric_choice}",
+                title=f"{prev_label} - {metric_choice}",
                 diff=False,
                 percent=percent_metric,
             )
@@ -950,7 +1022,7 @@ try:
                 attr_x=attr_x,
                 attr_y=attr_y,
                 value_col="value",
-                title=f"差异（近7天 - 过去7天）- {metric_choice}",
+                title=f"差异（{cur_label} - {prev_label}）- {metric_choice}",
                 diff=True,
                 percent=percent_metric,
             )
@@ -967,7 +1039,7 @@ try:
                 return out
 
             with col1:
-                st.markdown("**近7天明细**")
+                st.markdown(f"**{cur_label} 明细**")
                 st.dataframe(
                     format_detail_df(cur_src_small.sort_values("value", ascending=False), percent_metric),
                     use_container_width=True,
@@ -975,7 +1047,7 @@ try:
                 )
 
             with col2:
-                st.markdown("**过去7天明细**")
+                st.markdown(f"**{prev_label} 明细**")
                 st.dataframe(
                     format_detail_df(prev_src_small.sort_values("value", ascending=False), percent_metric),
                     use_container_width=True,
