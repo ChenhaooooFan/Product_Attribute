@@ -14,7 +14,9 @@ except Exception:
 st.set_page_config(page_title="SKU 属性销售分析", layout="wide")
 
 st.title("SKU 属性销售分析仪表盘")
-st.caption("上传近7天销售数据、过去7天销售数据、SKU属性对照表后，自动完成 SKU 映射、单属性分析、两两属性 Heat Map 分析。")
+st.caption(
+    "上传近7天销售数据、过去7天销售数据、SKU属性对照表后，自动完成 SKU 映射、单属性分析、两两属性 Heat Map 分析，并生成中文摘要。"
+)
 
 
 def clean_text(x):
@@ -67,6 +69,22 @@ def split_multi_value(x):
             seen.add(key)
             deduped.append(item)
     return deduped
+
+
+def format_pct(x):
+    if pd.isna(x):
+        return "无法计算"
+    return f"{x * 100:.1f}%"
+
+
+def format_signed_currency(x):
+    sign = "+" if x > 0 else "-" if x < 0 else ""
+    return f"{sign}${abs(x):,.2f}"
+
+
+def format_signed_number(x, digits=0):
+    sign = "+" if x > 0 else "-" if x < 0 else ""
+    return f"{sign}{abs(x):,.{digits}f}"
 
 
 def load_sales(file, label: str):
@@ -369,6 +387,195 @@ def show_kpi_row(cur_df, prev_df):
     c4.metric("SKU映射率", f"{cur_map:.1%}", f"{(cur_map - prev_map):.1%}")
 
 
+def generate_overall_summary(cur_df, prev_df):
+    cur_sales = cur_df["Sales"].sum()
+    prev_sales = prev_df["Sales"].sum()
+    cur_units = cur_df["Quantity"].sum()
+    prev_units = prev_df["Quantity"].sum()
+    cur_lines = len(cur_df)
+    prev_lines = len(prev_df)
+
+    cur_refund = cur_df["Refund Amount"].sum()
+    prev_refund = prev_df["Refund Amount"].sum()
+
+    sales_diff = cur_sales - prev_sales
+    units_diff = cur_units - prev_units
+    lines_diff = cur_lines - prev_lines
+    refund_diff = cur_refund - prev_refund
+
+    sales_pct = sales_diff / prev_sales if prev_sales != 0 else np.nan
+    units_pct = units_diff / prev_units if prev_units != 0 else np.nan
+    lines_pct = lines_diff / prev_lines if prev_lines != 0 else np.nan
+    refund_pct = refund_diff / prev_refund if prev_refund != 0 else np.nan
+
+    cur_map = cur_df["Mapped"].mean() if len(cur_df) else 0
+
+    trend_sales = "上升" if sales_diff > 0 else "下降" if sales_diff < 0 else "持平"
+    trend_units = "增加" if units_diff > 0 else "减少" if units_diff < 0 else "持平"
+    trend_lines = "提升" if lines_diff > 0 else "回落" if lines_diff < 0 else "持平"
+    trend_refund = "上升" if refund_diff > 0 else "下降" if refund_diff < 0 else "持平"
+
+    texts = [
+        f"近 7 天整体销售额为 ${cur_sales:,.2f}，相比过去 7 天{trend_sales}了 ${abs(sales_diff):,.2f}，变化幅度为 {format_pct(sales_pct)}。",
+        f"从销量来看，近 7 天共销售 {cur_units:,.0f} 件，较过去 7 天{trend_units}了 {abs(units_diff):,.0f} 件，变化幅度为 {format_pct(units_pct)}。",
+        f"从订单行数来看，本周共有 {cur_lines:,} 条订单记录，较上周{trend_lines}了 {abs(lines_diff):,} 条，变化幅度为 {format_pct(lines_pct)}。",
+        f"从退款金额来看，近 7 天退款金额为 ${cur_refund:,.2f}，较过去 7 天{trend_refund}了 ${abs(refund_diff):,.2f}，变化幅度为 {format_pct(refund_pct)}。",
+        f"当前 SKU 属性映射率为 {cur_map:.1%}，说明本次属性分析对整体销售样本的覆盖度{'较高' if cur_map >= 0.85 else '中等' if cur_map >= 0.6 else '偏低'}。"
+    ]
+
+    if sales_diff > 0 and units_diff > 0:
+        texts.append("这说明本周不仅销售额增长，销量也同步提升，整体趋势偏强，属于比较健康的增长状态。")
+    elif sales_diff > 0 and units_diff <= 0:
+        texts.append("这说明虽然销量没有同步明显放大，但销售额有所提升，可能是高客单价 SKU 或高价值属性组合贡献了更多收入。")
+    elif sales_diff < 0 and units_diff < 0:
+        texts.append("这说明本周整体成交活跃度和销售表现都出现回落，需要重点关注属性结构、投放表现和 SKU 供给是否发生变化。")
+    else:
+        texts.append("本周销售额和销量的变化方向并不完全一致，建议结合属性组合和具体 SKU 结构做进一步拆解。")
+
+    return texts
+
+
+def generate_attribute_summary(comp_df, attr_col, metric="sales", top_n=5):
+    cur_col = f"{metric}_cur"
+    diff_col = f"{metric}_diff"
+
+    df = comp_df.copy()
+
+    if len(df) == 0:
+        return [f"{attr_col} 维度当前没有可分析的数据。"]
+
+    df = df.sort_values(cur_col, ascending=False)
+    top_cur = df.head(top_n)
+    top_growth = df.sort_values(diff_col, ascending=False).head(top_n)
+    top_decline = df.sort_values(diff_col, ascending=True).head(top_n)
+
+    texts = []
+
+    if len(top_cur) > 0:
+        top_names = "、".join(top_cur[attr_col].astype(str).tolist())
+        texts.append(
+            f"从 {attr_col} 维度来看，近 7 天贡献最高的属性词主要包括：{top_names}。这些属性词构成了当前阶段最核心的销售贡献来源。"
+        )
+
+    if len(top_growth) > 0:
+        growth_names = "、".join(top_growth[attr_col].astype(str).tolist())
+        texts.append(
+            f"从环比增长角度看，提升最明显的属性词包括：{growth_names}。这些属性在近 7 天相较过去 7 天获得了更强的市场反馈。"
+        )
+
+    if len(top_decline) > 0:
+        decline_names = "、".join(top_decline[attr_col].astype(str).tolist())
+        texts.append(
+            f"从回落角度看，下降较明显的属性词包括：{decline_names}。这类属性近期热度有所减弱，后续可以结合上新节奏与投放表现继续观察。"
+        )
+
+    leader = top_cur.iloc[0] if len(top_cur) > 0 else None
+    if leader is not None:
+        texts.append(
+            f"其中，{leader[attr_col]} 在近 7 天的销售额为 ${leader['sales_cur']:,.2f}，销量为 {leader['units_cur']:,.0f}，说明它既可能是高频成交属性，也可能承接了较多头部 SKU 的销售。"
+        )
+
+    return texts
+
+
+def generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, top_n=5):
+    texts = []
+
+    if len(cur_src) == 0:
+        return [f"{attr_x} × {attr_y} 当前没有可分析的数据。"]
+
+    cur_top = cur_src.sort_values("value", ascending=False).head(top_n).copy()
+
+    diff_src = cur_src.merge(
+        prev_src,
+        on=[attr_x, attr_y],
+        how="outer",
+        suffixes=("_cur", "_prev"),
+    ).fillna(0)
+    diff_src["diff"] = diff_src["value_cur"] - diff_src["value_prev"]
+
+    growth_top = diff_src.sort_values("diff", ascending=False).head(top_n).copy()
+    decline_top = diff_src.sort_values("diff", ascending=True).head(top_n).copy()
+
+    if len(cur_top) > 0:
+        combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in cur_top.iterrows()]
+        texts.append(
+            f"从 {attr_x} × {attr_y} 的组合关系来看，近 7 天表现最强的组合主要有：{'、'.join(combos)}。这些组合是当前销售贡献最集中的核心搭配。"
+        )
+
+    if len(growth_top) > 0:
+        combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in growth_top.iterrows()]
+        texts.append(
+            f"从周环比变化来看，增长最明显的组合包括：{'、'.join(combos)}。说明这些属性搭配在当前周期内更容易获得用户认可。"
+        )
+
+    if len(decline_top) > 0:
+        combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in decline_top.iterrows()]
+        texts.append(
+            f"相对而言，回落较明显的组合包括：{'、'.join(combos)}。这类组合近期表现转弱，建议后续结合内容投放、库存和款式生命周期继续判断。"
+        )
+
+    texts.append(
+        "整体来看，属性之间并不是平均贡献销售，而是呈现出明显的头部聚集效应，因此后续在选款、补货和内容策略上，更适合围绕高贡献组合做集中优化。"
+    )
+
+    return texts
+
+
+def generate_business_suggestions(comp_df, attr_col, top_n=3):
+    texts = []
+
+    if len(comp_df) == 0:
+        return [f"{attr_col} 当前没有足够数据，暂时无法形成业务建议。"]
+
+    strong_growth = comp_df.sort_values("sales_diff", ascending=False).head(top_n)
+    strong_decline = comp_df.sort_values("sales_diff", ascending=True).head(top_n)
+    high_sales = comp_df.sort_values("sales_cur", ascending=False).head(top_n)
+
+    if len(high_sales) > 0:
+        names = "、".join(high_sales[attr_col].astype(str).tolist())
+        texts.append(f"建议优先围绕 {names} 这类当前销售贡献较高的属性做重点补货、选款和内容投放。")
+
+    if len(strong_growth) > 0:
+        names = "、".join(strong_growth[attr_col].astype(str).tolist())
+        texts.append(f"对于 {names} 这类近期增长较快的属性，建议作为下一阶段重点观察和放大的方向。")
+
+    if len(strong_decline) > 0:
+        names = "、".join(strong_decline[attr_col].astype(str).tolist())
+        texts.append(f"对于 {names} 这类近期回落较明显的属性，建议控制上新密度，并结合库存和转化数据进一步判断是否降权。")
+
+    return texts
+
+
+def prepare_display_table(comp_df, attr_col):
+    out = comp_df.copy()
+
+    pct_cols = [
+        "sales_pct", "units_pct", "order_lines_pct", "refund_pct", "sku_count_pct"
+    ]
+    for col in pct_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "N/A")
+
+    money_cols = [
+        "sales_cur", "sales_prev", "sales_diff", "refund_cur", "refund_prev", "refund_diff"
+    ]
+    for col in money_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: f"${x:,.2f}")
+
+    num_cols = [
+        "units_cur", "units_prev", "units_diff",
+        "order_lines_cur", "order_lines_prev", "order_lines_diff",
+        "sku_count_cur", "sku_count_prev", "sku_count_diff"
+    ]
+    for col in num_cols:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: f"{x:,.0f}")
+
+    return out
+
+
 st.sidebar.header("上传文件")
 current_file = st.sidebar.file_uploader("近 7 天销售数据（CSV）", type=["csv"], key="current")
 previous_file = st.sidebar.file_uploader("过去 7 天销售数据（CSV）", type=["csv"], key="previous")
@@ -391,6 +598,7 @@ metric_choice = st.sidebar.selectbox(
 
 max_pair_count = st.sidebar.slider("自动模式最多展示多少组属性组合", min_value=1, max_value=15, value=6)
 heatmap_top_n = st.sidebar.slider("Heat Map 每轴最多保留多少个属性词", min_value=5, max_value=30, value=12)
+top_summary_n = st.sidebar.slider("自动摘要最多引用多少个属性/组合", min_value=3, max_value=10, value=5)
 
 if not (current_file and previous_file and attr_file):
     st.info("请先在左侧上传 3 个 CSV 文件。")
@@ -423,6 +631,12 @@ try:
         st.stop()
 
     show_kpi_row(merged_cur, merged_prev)
+
+    st.markdown("---")
+    st.header("自动分析摘要")
+    overall_texts = generate_overall_summary(merged_cur, merged_prev)
+    for t in overall_texts:
+        st.write("• " + t)
 
     with st.expander("映射质量检查", expanded=False):
         col1, col2 = st.columns(2)
@@ -461,7 +675,19 @@ try:
         "refund_cur", "refund_prev", "refund_diff", "refund_pct",
         "sku_count_cur", "sku_count_prev", "sku_count_diff", "sku_count_pct",
     ]
-    st.dataframe(comp_df[display_cols], use_container_width=True, hide_index=True)
+
+    comp_df_display = prepare_display_table(comp_df[display_cols].copy(), focus_attr)
+    st.dataframe(comp_df_display, use_container_width=True, hide_index=True)
+
+    st.markdown("#### 单属性分析解读")
+    attr_texts = generate_attribute_summary(comp_df, focus_attr, metric="sales", top_n=top_summary_n)
+    for t in attr_texts:
+        st.write("• " + t)
+
+    st.markdown("#### 单属性业务建议")
+    suggestion_texts = generate_business_suggestions(comp_df, focus_attr, top_n=3)
+    for t in suggestion_texts:
+        st.write("• " + t)
 
     chart_metric = st.radio(
         "单属性柱状图指标",
@@ -510,7 +736,6 @@ try:
 
         pair_scores = sorted(pair_scores, key=lambda x: x[1], reverse=True)
         display_pairs = [p for p, _ in pair_scores[:max_pair_count]]
-
         st.write(f"当前自动展示前 {len(display_pairs)} 组组合。")
 
     else:
@@ -520,7 +745,6 @@ try:
         with col_b:
             manual_y_options = [x for x in selected_attrs if x != manual_x]
             manual_y = st.selectbox("选择 Y 轴属性", options=manual_y_options, key="manual_y")
-
         display_pairs = [(manual_x, manual_y)]
 
     for idx, (attr_x, attr_y) in enumerate(display_pairs, start=1):
@@ -528,6 +752,11 @@ try:
 
         cur_src = build_heatmap_source(merged_cur, attr_x, attr_y, metric_choice)
         prev_src = build_heatmap_source(merged_prev, attr_x, attr_y, metric_choice)
+
+        heatmap_texts = generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, top_n=top_summary_n)
+        st.markdown("#### 组合分析解读")
+        for t in heatmap_texts:
+            st.write("• " + t)
 
         cur_src_small = keep_top_labels(cur_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
         prev_src_small = keep_top_labels(prev_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
@@ -579,15 +808,21 @@ try:
 
             with col1:
                 st.markdown("**近7天明细**")
-                st.dataframe(cur_src_small.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+                show_df = cur_src_small.copy()
+                show_df["value"] = show_df["value"].map(lambda x: f"{x:,.2f}")
+                st.dataframe(show_df.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
 
             with col2:
                 st.markdown("**过去7天明细**")
-                st.dataframe(prev_src_small.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+                show_df = prev_src_small.copy()
+                show_df["value"] = show_df["value"].map(lambda x: f"{x:,.2f}")
+                st.dataframe(show_df.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
 
             with col3:
                 st.markdown("**差异明细**")
-                st.dataframe(diff_src_small.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+                show_df = diff_src_small.copy()
+                show_df["value"] = show_df["value"].map(lambda x: f"{x:,.2f}")
+                st.dataframe(show_df.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
 
     st.markdown("---")
     st.header("明细数据导出")
