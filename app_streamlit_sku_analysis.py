@@ -77,16 +77,6 @@ def format_pct(x):
     return f"{x * 100:.1f}%"
 
 
-def format_signed_currency(x):
-    sign = "+" if x > 0 else "-" if x < 0 else ""
-    return f"{sign}${abs(x):,.2f}"
-
-
-def format_signed_number(x, digits=0):
-    sign = "+" if x > 0 else "-" if x < 0 else ""
-    return f"{sign}{abs(x):,.{digits}f}"
-
-
 def load_sales(file, label: str):
     df = pd.read_csv(file)
     df.columns = [str(c).strip() for c in df.columns]
@@ -115,6 +105,7 @@ def load_sales(file, label: str):
     if "Order Status" not in df.columns:
         df["Order Status"] = "Unknown"
 
+    df["Has Refund"] = np.where(df["Refund Amount"] > 0, 1, 0)
     df["Period"] = label
     return df
 
@@ -131,6 +122,42 @@ def load_attr(file):
         attr[col] = attr[col].apply(clean_text)
 
     attr["SKU"] = attr["SKU"].astype(str).str.strip().str.upper()
+
+    if "上架时间" in attr.columns:
+        attr["上架时间"] = pd.to_datetime(attr["上架时间"], errors="coerce")
+
+        attr["上架月份"] = attr["上架时间"].dt.strftime("%Y-%m")
+        attr["上架月份"] = attr["上架月份"].fillna("(空值)")
+
+        def format_quarter(dt):
+            if pd.isna(dt):
+                return "(空值)"
+            return f"{dt.year}Q{dt.quarter}"
+
+        attr["上架季度"] = attr["上架时间"].apply(format_quarter)
+
+        today = pd.Timestamp.today().normalize()
+        attr["上架天数"] = (today - attr["上架时间"]).dt.days
+
+        def classify_launch_stage(days):
+            if pd.isna(days):
+                return "(空值)"
+            if days <= 30:
+                return "新品"
+            elif days <= 90:
+                return "次新品"
+            elif days <= 180:
+                return "常规款"
+            else:
+                return "老款"
+
+        attr["上新阶段"] = attr["上架天数"].apply(classify_launch_stage)
+    else:
+        attr["上架月份"] = "(空值)"
+        attr["上架季度"] = "(空值)"
+        attr["上新阶段"] = "(空值)"
+        attr["上架天数"] = np.nan
+
     attr = attr.drop_duplicates(subset=["SKU"], keep="first").copy()
     return attr
 
@@ -143,15 +170,23 @@ def merge_sales_attr(sales_df, attr_df):
 
 def choose_attribute_columns(df):
     excluded = {
-        "SKU", "中文名称", "款式英文名称", "图片", "上架时间",
-        "Seller SKU", "Base SKU", "Period", "Mapped"
+        "SKU",
+        "中文名称",
+        "款式英文名称",
+        "图片",
+        "上架时间",
+        "上架天数",
+        "Seller SKU",
+        "Base SKU",
+        "Period",
+        "Mapped"
     }
 
     candidates = []
     for col in df.columns:
         if col in excluded:
             continue
-        if col in ["Quantity", "Sales", "Refund Amount"]:
+        if col in ["Quantity", "Sales", "Refund Amount", "Has Refund"]:
             continue
         if pd.api.types.is_numeric_dtype(df[col]):
             continue
@@ -184,13 +219,18 @@ def explode_attribute(df, attr_col):
 
 def aggregate_by_attribute(df, attr_col):
     tmp = explode_attribute(df, attr_col)
+
     g = tmp.groupby("_attr_item", dropna=False).agg(
         order_lines=("Seller SKU", "count"),
         units=("Quantity", "sum"),
         sales=("Sales", "sum"),
         refund=("Refund Amount", "sum"),
+        refund_orders=("Has Refund", "sum"),
         sku_count=("Base SKU", "nunique")
     ).reset_index().rename(columns={"_attr_item": attr_col})
+
+    g["refund_rate_by_orders"] = np.where(g["order_lines"] == 0, np.nan, g["refund_orders"] / g["order_lines"])
+    g["refund_to_sales_ratio"] = np.where(g["sales"] == 0, np.nan, g["refund"] / g["sales"])
 
     return g.sort_values("sales", ascending=False)
 
@@ -201,6 +241,9 @@ def compare_periods(cur_df, prev_df, attr_col):
         "units": "units_cur",
         "sales": "sales_cur",
         "refund": "refund_cur",
+        "refund_orders": "refund_orders_cur",
+        "refund_rate_by_orders": "refund_rate_by_orders_cur",
+        "refund_to_sales_ratio": "refund_to_sales_ratio_cur",
         "sku_count": "sku_count_cur",
     })
 
@@ -209,12 +252,20 @@ def compare_periods(cur_df, prev_df, attr_col):
         "units": "units_prev",
         "sales": "sales_prev",
         "refund": "refund_prev",
+        "refund_orders": "refund_orders_prev",
+        "refund_rate_by_orders": "refund_rate_by_orders_prev",
+        "refund_to_sales_ratio": "refund_to_sales_ratio_prev",
         "sku_count": "sku_count_prev",
     })
 
     merged = cur.merge(prev, on=attr_col, how="outer").fillna(0)
 
-    for metric in ["order_lines", "units", "sales", "refund", "sku_count"]:
+    metrics = [
+        "order_lines", "units", "sales", "refund", "refund_orders",
+        "refund_rate_by_orders", "refund_to_sales_ratio", "sku_count"
+    ]
+
+    for metric in metrics:
         merged[f"{metric}_diff"] = merged[f"{metric}_cur"] - merged[f"{metric}_prev"]
         merged[f"{metric}_pct"] = np.where(
             merged[f"{metric}_prev"] == 0,
@@ -240,17 +291,32 @@ def build_heatmap_source(df, attr_x, attr_y, metric):
     tmp["_x_items"] = tmp["_x_items"].fillna("(空值)")
     tmp["_y_items"] = tmp["_y_items"].fillna("(空值)")
 
-    metric_map = {
-        "sales": "Sales",
-        "units": "Quantity",
-        "order_lines": "Seller SKU",
-        "refund": "Refund Amount",
-    }
-
-    if metric == "order_lines":
+    if metric == "sales":
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)["Sales"].sum().reset_index(name="value")
+    elif metric == "units":
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)["Quantity"].sum().reset_index(name="value")
+    elif metric == "order_lines":
         src = tmp.groupby(["_y_items", "_x_items"], dropna=False).size().reset_index(name="value")
+    elif metric == "refund":
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)["Refund Amount"].sum().reset_index(name="value")
+    elif metric == "refund_orders":
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)["Has Refund"].sum().reset_index(name="value")
+    elif metric == "refund_rate":
+        grp = tmp.groupby(["_y_items", "_x_items"], dropna=False).agg(
+            refund_orders=("Has Refund", "sum"),
+            order_lines=("Seller SKU", "count")
+        ).reset_index()
+        grp["value"] = np.where(grp["order_lines"] == 0, np.nan, grp["refund_orders"] / grp["order_lines"])
+        src = grp[["_y_items", "_x_items", "value"]].copy()
+    elif metric == "refund_to_sales_ratio":
+        grp = tmp.groupby(["_y_items", "_x_items"], dropna=False).agg(
+            refund=("Refund Amount", "sum"),
+            sales=("Sales", "sum")
+        ).reset_index()
+        grp["value"] = np.where(grp["sales"] == 0, np.nan, grp["refund"] / grp["sales"])
+        src = grp[["_y_items", "_x_items", "value"]].copy()
     else:
-        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)[metric_map[metric]].sum().reset_index(name="value")
+        src = tmp.groupby(["_y_items", "_x_items"], dropna=False)["Sales"].sum().reset_index(name="value")
 
     src = src.rename(columns={
         "_x_items": attr_x,
@@ -263,8 +329,11 @@ def keep_top_labels(src_df, attr_x, attr_y, value_col="value", top_n=12):
     if len(src_df) == 0:
         return src_df.copy()
 
+    temp = src_df.copy()
+    temp[value_col] = pd.to_numeric(temp[value_col], errors="coerce").fillna(0)
+
     top_x = (
-        src_df.groupby(attr_x)[value_col]
+        temp.groupby(attr_x)[value_col]
         .sum()
         .sort_values(ascending=False)
         .head(top_n)
@@ -272,20 +341,20 @@ def keep_top_labels(src_df, attr_x, attr_y, value_col="value", top_n=12):
     )
 
     top_y = (
-        src_df.groupby(attr_y)[value_col]
+        temp.groupby(attr_y)[value_col]
         .sum()
         .sort_values(ascending=False)
         .head(top_n)
         .index
     )
 
-    out = src_df[src_df[attr_x].isin(top_x) & src_df[attr_y].isin(top_y)].copy()
+    out = temp[temp[attr_x].isin(top_x) & temp[attr_y].isin(top_y)].copy()
     return out
 
 
 def sort_matrix(matrix):
-    row_order = matrix.sum(axis=1).sort_values(ascending=False).index
-    col_order = matrix.sum(axis=0).sort_values(ascending=False).index
+    row_order = matrix.fillna(0).sum(axis=1).sort_values(ascending=False).index
+    col_order = matrix.fillna(0).sum(axis=0).sort_values(ascending=False).index
     return matrix.loc[row_order, col_order]
 
 
@@ -313,25 +382,25 @@ def render_bar_chart(plot_df, x_col, title, y_label):
         st.caption("当前环境未安装 plotly，已自动切换为 Streamlit 原生柱状图。")
 
 
-def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
+def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False, percent=False):
     if len(src_df) == 0:
         st.info("该组合没有数据。")
         return
 
-    matrix = src_df.pivot(index=attr_y, columns=attr_x, values=value_col).fillna(0)
+    matrix = src_df.pivot(index=attr_y, columns=attr_x, values=value_col)
     matrix = sort_matrix(matrix)
 
     st.markdown(f"**{title}**")
 
     if px is not None:
         if diff:
-            max_abs = float(np.abs(matrix.values).max()) if matrix.size else 0.0
-            if max_abs == 0:
+            max_abs = float(np.nanmax(np.abs(matrix.values))) if matrix.size else 0.0
+            if max_abs == 0 or np.isnan(max_abs):
                 max_abs = 1.0
 
             fig = px.imshow(
                 matrix,
-                text_auto=True,
+                text_auto=".1%" if percent else True,
                 aspect="auto",
                 color_continuous_scale="RdYlGn",
                 range_color=[-max_abs, max_abs],
@@ -339,14 +408,14 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
         else:
             fig = px.imshow(
                 matrix,
-                text_auto=True,
+                text_auto=".1%" if percent else True,
                 aspect="auto",
                 color_continuous_scale="YlOrRd",
             )
 
         fig.update_traces(
             textfont_size=12,
-            hovertemplate=f"{attr_y}: %{{y}}<br>{attr_x}: %{{x}}<br>值: %{{z:,.2f}}<extra></extra>"
+            hovertemplate=f"{attr_y}: %{{y}}<br>{attr_x}: %{{x}}<br>值: %{{z}}<extra></extra>"
         )
 
         fig.update_layout(
@@ -359,12 +428,16 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
         )
 
         st.plotly_chart(fig, use_container_width=True)
-
     else:
-        if diff:
-            styled = matrix.style.format("{:.2f}").background_gradient(cmap="RdYlGn", axis=None)
+        if percent:
+            styled = matrix.style.format("{:.1%}")
         else:
-            styled = matrix.style.format("{:.2f}").background_gradient(cmap="YlOrRd", axis=None)
+            styled = matrix.style.format("{:.2f}")
+
+        if diff:
+            styled = styled.background_gradient(cmap="RdYlGn", axis=None)
+        else:
+            styled = styled.background_gradient(cmap="YlOrRd", axis=None)
 
         st.dataframe(styled, use_container_width=True)
         st.caption("当前环境未安装 plotly，已自动切换为表格热力图。")
@@ -373,23 +446,41 @@ def render_heatmap(src_df, attr_x, attr_y, value_col, title, diff=False):
 def show_kpi_row(cur_df, prev_df):
     cur_sales = cur_df["Sales"].sum()
     prev_sales = prev_df["Sales"].sum()
+
     cur_units = cur_df["Quantity"].sum()
     prev_units = prev_df["Quantity"].sum()
+
     cur_lines = len(cur_df)
     prev_lines = len(prev_df)
+
     cur_map = cur_df["Mapped"].mean() if len(cur_df) else 0
     prev_map = prev_df["Mapped"].mean() if len(prev_df) else 0
 
     c1, c2, c3, c4 = st.columns(4)
     c1.metric(
-    "近7天销售额",
-    f"${cur_sales:,.2f}",
-    f"${cur_sales - prev_sales:,.2f}",
-    delta_color="normal"
-)
-    c2.metric("近7天销量", f"{cur_units:,.0f}", f"{cur_units - prev_units:,.0f}")
-    c3.metric("近7天订单行", f"{cur_lines:,}", f"{cur_lines - prev_lines:,}")
-    c4.metric("SKU映射率", f"{cur_map:.1%}", f"{(cur_map - prev_map):.1%}")
+        "近7天销售额",
+        f"${cur_sales:,.2f}",
+        f"${cur_sales - prev_sales:,.2f}",
+        delta_color="normal",
+    )
+    c2.metric(
+        "近7天销量",
+        f"{cur_units:,.0f}",
+        f"{cur_units - prev_units:,.0f}",
+        delta_color="normal",
+    )
+    c3.metric(
+        "近7天订单行",
+        f"{cur_lines:,}",
+        f"{cur_lines - prev_lines:,}",
+        delta_color="normal",
+    )
+    c4.metric(
+        "SKU映射率",
+        f"{cur_map:.1%}",
+        f"{(cur_map - prev_map):.1%}",
+        delta_color="normal",
+    )
 
 
 def generate_overall_summary(cur_df, prev_df):
@@ -403,39 +494,45 @@ def generate_overall_summary(cur_df, prev_df):
     cur_refund = cur_df["Refund Amount"].sum()
     prev_refund = prev_df["Refund Amount"].sum()
 
+    cur_refund_orders = cur_df["Has Refund"].sum()
+    prev_refund_orders = prev_df["Has Refund"].sum()
+
     sales_diff = cur_sales - prev_sales
     units_diff = cur_units - prev_units
     lines_diff = cur_lines - prev_lines
     refund_diff = cur_refund - prev_refund
+    refund_orders_diff = cur_refund_orders - prev_refund_orders
 
     sales_pct = sales_diff / prev_sales if prev_sales != 0 else np.nan
     units_pct = units_diff / prev_units if prev_units != 0 else np.nan
     lines_pct = lines_diff / prev_lines if prev_lines != 0 else np.nan
     refund_pct = refund_diff / prev_refund if prev_refund != 0 else np.nan
+    refund_orders_pct = refund_orders_diff / prev_refund_orders if prev_refund_orders != 0 else np.nan
 
     cur_map = cur_df["Mapped"].mean() if len(cur_df) else 0
 
-    trend_sales = "上升" if sales_diff > 0 else "下降" if sales_diff < 0 else "持平"
-    trend_units = "增加" if units_diff > 0 else "减少" if units_diff < 0 else "持平"
-    trend_lines = "提升" if lines_diff > 0 else "回落" if lines_diff < 0 else "持平"
-    trend_refund = "上升" if refund_diff > 0 else "下降" if refund_diff < 0 else "持平"
-
     texts = [
-        f"近 7 天整体销售额为 ${cur_sales:,.2f}，相比过去 7 天{trend_sales}了 ${abs(sales_diff):,.2f}，变化幅度为 {format_pct(sales_pct)}。",
-        f"从销量来看，近 7 天共销售 {cur_units:,.0f} 件，较过去 7 天{trend_units}了 {abs(units_diff):,.0f} 件，变化幅度为 {format_pct(units_pct)}。",
-        f"从订单行数来看，本周共有 {cur_lines:,} 条订单记录，较上周{trend_lines}了 {abs(lines_diff):,} 条，变化幅度为 {format_pct(lines_pct)}。",
-        f"从退款金额来看，近 7 天退款金额为 ${cur_refund:,.2f}，较过去 7 天{trend_refund}了 ${abs(refund_diff):,.2f}，变化幅度为 {format_pct(refund_pct)}。",
-        f"当前 SKU 属性映射率为 {cur_map:.1%}，说明本次属性分析对整体销售样本的覆盖度{'较高' if cur_map >= 0.85 else '中等' if cur_map >= 0.6 else '偏低'}。"
+        f"近 7 天整体销售额为 ${cur_sales:,.2f}，相比过去 7 天变化了 ${sales_diff:,.2f}，变化幅度为 {format_pct(sales_pct)}。",
+        f"近 7 天总销量为 {cur_units:,.0f} 件，相比过去 7 天变化了 {units_diff:,.0f} 件，变化幅度为 {format_pct(units_pct)}。",
+        f"近 7 天订单行数为 {cur_lines:,}，相比过去 7 天变化了 {lines_diff:,}，变化幅度为 {format_pct(lines_pct)}。",
+        f"近 7 天退款金额为 ${cur_refund:,.2f}，相比过去 7 天变化了 ${refund_diff:,.2f}，变化幅度为 {format_pct(refund_pct)}。",
+        f"近 7 天发生退款的订单行数为 {cur_refund_orders:,.0f}，相比过去 7 天变化了 {refund_orders_diff:,.0f}，变化幅度为 {format_pct(refund_orders_pct)}。",
+        f"当前 SKU 属性映射率为 {cur_map:.1%}，说明本次属性分析对整体样本的覆盖度{'较高' if cur_map >= 0.85 else '中等' if cur_map >= 0.6 else '偏低'}。"
     ]
 
     if sales_diff > 0 and units_diff > 0:
-        texts.append("这说明本周不仅销售额增长，销量也同步提升，整体趋势偏强，属于比较健康的增长状态。")
+        texts.append("这说明本周整体销售表现偏强，销售额和销量同步改善。")
     elif sales_diff > 0 and units_diff <= 0:
-        texts.append("这说明虽然销量没有同步明显放大，但销售额有所提升，可能是高客单价 SKU 或高价值属性组合贡献了更多收入。")
+        texts.append("这说明本周销售额提升更多可能来自高客单价款式，而不是纯粹靠销量扩大。")
     elif sales_diff < 0 and units_diff < 0:
-        texts.append("这说明本周整体成交活跃度和销售表现都出现回落，需要重点关注属性结构、投放表现和 SKU 供给是否发生变化。")
+        texts.append("这说明本周整体成交表现走弱，建议进一步拆解属性结构和主力 SKU 的变化。")
     else:
-        texts.append("本周销售额和销量的变化方向并不完全一致，建议结合属性组合和具体 SKU 结构做进一步拆解。")
+        texts.append("本周销售额与销量的变化方向并不完全一致，建议结合属性和退款表现做进一步分析。")
+
+    if refund_diff > 0:
+        texts.append("退款金额上升意味着本周售后压力有所变大，建议重点观察哪些属性和组合更容易产生退款。")
+    elif refund_diff < 0:
+        texts.append("退款金额下降说明本周售后表现有所改善，可以继续观察改善是否来自某些属性组合结构优化。")
 
     return texts
 
@@ -445,11 +542,11 @@ def generate_attribute_summary(comp_df, attr_col, metric="sales", top_n=5):
     diff_col = f"{metric}_diff"
 
     df = comp_df.copy()
-
     if len(df) == 0:
         return [f"{attr_col} 维度当前没有可分析的数据。"]
 
     df = df.sort_values(cur_col, ascending=False)
+
     top_cur = df.head(top_n)
     top_growth = df.sort_values(diff_col, ascending=False).head(top_n)
     top_decline = df.sort_values(diff_col, ascending=True).head(top_n)
@@ -458,34 +555,52 @@ def generate_attribute_summary(comp_df, attr_col, metric="sales", top_n=5):
 
     if len(top_cur) > 0:
         top_names = "、".join(top_cur[attr_col].astype(str).tolist())
-        texts.append(
-            f"从 {attr_col} 维度来看，近 7 天贡献最高的属性词主要包括：{top_names}。这些属性词构成了当前阶段最核心的销售贡献来源。"
-        )
+        texts.append(f"从 {attr_col} 维度来看，近 7 天贡献最高的属性词主要包括：{top_names}。这些属性词构成了当前阶段最核心的销售贡献来源。")
 
     if len(top_growth) > 0:
         growth_names = "、".join(top_growth[attr_col].astype(str).tolist())
-        texts.append(
-            f"从环比增长角度看，提升最明显的属性词包括：{growth_names}。这些属性在近 7 天相较过去 7 天获得了更强的市场反馈。"
-        )
+        texts.append(f"从环比增长角度看，提升最明显的属性词包括：{growth_names}。这些属性在近 7 天相较过去 7 天获得了更强的市场反馈。")
 
     if len(top_decline) > 0:
         decline_names = "、".join(top_decline[attr_col].astype(str).tolist())
-        texts.append(
-            f"从回落角度看，下降较明显的属性词包括：{decline_names}。这类属性近期热度有所减弱，后续可以结合上新节奏与投放表现继续观察。"
-        )
+        texts.append(f"从回落角度看，下降较明显的属性词包括：{decline_names}。这类属性近期热度有所减弱，后续可以结合上新节奏与投放表现继续观察。")
 
     leader = top_cur.iloc[0] if len(top_cur) > 0 else None
     if leader is not None:
         texts.append(
-            f"其中，{leader[attr_col]} 在近 7 天的销售额为 ${leader['sales_cur']:,.2f}，销量为 {leader['units_cur']:,.0f}，说明它既可能是高频成交属性，也可能承接了较多头部 SKU 的销售。"
+            f"其中，{leader[attr_col]} 在近 7 天的销售额为 ${leader['sales_cur']:,.2f}，销量为 {leader['units_cur']:,.0f}，退款金额为 ${leader['refund_cur']:,.2f}，说明它既是主力成交属性，也值得同步关注其售后表现。"
         )
 
     return texts
 
 
-def generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, top_n=5):
+def generate_refund_summary(comp_df, attr_col, top_n=5):
+    df = comp_df.copy()
+    if len(df) == 0:
+        return [f"{attr_col} 维度当前没有足够退款数据。"]
+
+    high_refund_amt = df.sort_values("refund_cur", ascending=False).head(top_n)
+    high_refund_rate = df.sort_values("refund_rate_by_orders_cur", ascending=False).head(top_n)
+    high_refund_ratio = df.sort_values("refund_to_sales_ratio_cur", ascending=False).head(top_n)
+
     texts = []
 
+    if len(high_refund_amt) > 0:
+        names = "、".join(high_refund_amt[attr_col].astype(str).tolist())
+        texts.append(f"从退款金额来看，近 7 天退款金额较高的属性词主要包括：{names}。这些属性对应的售后金额压力更大。")
+
+    if len(high_refund_rate) > 0:
+        names = "、".join(high_refund_rate[attr_col].astype(str).tolist())
+        texts.append(f"从退款订单占比来看，更容易发生退款的属性词包括：{names}。这些属性在成交后更容易产生售后问题。")
+
+    if len(high_refund_ratio) > 0:
+        names = "、".join(high_refund_ratio[attr_col].astype(str).tolist())
+        texts.append(f"从退款金额占销售额比例来看，风险更高的属性词包括：{names}。这类属性需要重点检查款式稳定性、预期管理和质检表现。")
+
+    return texts
+
+
+def generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, top_n=5):
     if len(cur_src) == 0:
         return [f"{attr_x} × {attr_y} 当前没有可分析的数据。"]
 
@@ -502,40 +617,35 @@ def generate_heatmap_summary(cur_src, prev_src, attr_x, attr_y, top_n=5):
     growth_top = diff_src.sort_values("diff", ascending=False).head(top_n).copy()
     decline_top = diff_src.sort_values("diff", ascending=True).head(top_n).copy()
 
+    texts = []
+
     if len(cur_top) > 0:
         combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in cur_top.iterrows()]
-        texts.append(
-            f"从 {attr_x} × {attr_y} 的组合关系来看，近 7 天表现最强的组合主要有：{'、'.join(combos)}。这些组合是当前销售贡献最集中的核心搭配。"
-        )
+        texts.append(f"从 {attr_x} × {attr_y} 的组合关系来看，近 7 天表现最强的组合主要有：{'、'.join(combos)}。这些组合是当前销售贡献最集中的核心搭配。")
 
     if len(growth_top) > 0:
         combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in growth_top.iterrows()]
-        texts.append(
-            f"从周环比变化来看，增长最明显的组合包括：{'、'.join(combos)}。说明这些属性搭配在当前周期内更容易获得用户认可。"
-        )
+        texts.append(f"从周环比变化来看，增长最明显的组合包括：{'、'.join(combos)}。说明这些属性搭配在当前周期内更容易获得用户认可。")
 
     if len(decline_top) > 0:
         combos = [f"{r[attr_x]} × {r[attr_y]}" for _, r in decline_top.iterrows()]
-        texts.append(
-            f"相对而言，回落较明显的组合包括：{'、'.join(combos)}。这类组合近期表现转弱，建议后续结合内容投放、库存和款式生命周期继续判断。"
-        )
+        texts.append(f"相对而言，回落较明显的组合包括：{'、'.join(combos)}。这类组合近期表现转弱，建议结合库存、内容和生命周期继续判断。")
 
-    texts.append(
-        "整体来看，属性之间并不是平均贡献销售，而是呈现出明显的头部聚集效应，因此后续在选款、补货和内容策略上，更适合围绕高贡献组合做集中优化。"
-    )
+    texts.append("整体来看，属性之间并不是平均贡献销售，而是呈现明显的头部聚集效应，因此后续在选款、补货和内容策略上，更适合围绕高贡献组合做集中优化。")
 
     return texts
 
 
 def generate_business_suggestions(comp_df, attr_col, top_n=3):
-    texts = []
-
     if len(comp_df) == 0:
         return [f"{attr_col} 当前没有足够数据，暂时无法形成业务建议。"]
 
     strong_growth = comp_df.sort_values("sales_diff", ascending=False).head(top_n)
     strong_decline = comp_df.sort_values("sales_diff", ascending=True).head(top_n)
     high_sales = comp_df.sort_values("sales_cur", ascending=False).head(top_n)
+    high_refund = comp_df.sort_values("refund_to_sales_ratio_cur", ascending=False).head(top_n)
+
+    texts = []
 
     if len(high_sales) > 0:
         names = "、".join(high_sales[attr_col].astype(str).tolist())
@@ -549,21 +659,30 @@ def generate_business_suggestions(comp_df, attr_col, top_n=3):
         names = "、".join(strong_decline[attr_col].astype(str).tolist())
         texts.append(f"对于 {names} 这类近期回落较明显的属性，建议控制上新密度，并结合库存和转化数据进一步判断是否降权。")
 
+    if len(high_refund) > 0:
+        names = "、".join(high_refund[attr_col].astype(str).tolist())
+        texts.append(f"对于 {names} 这类退款风险相对更高的属性，建议优先复盘产品质量、展示素材、尺码预期和包装交付问题。")
+
     return texts
 
 
-def prepare_display_table(comp_df, attr_col):
+def prepare_display_table(comp_df):
     out = comp_df.copy()
 
     pct_cols = [
-        "sales_pct", "units_pct", "order_lines_pct", "refund_pct", "sku_count_pct"
+        "sales_pct", "units_pct", "order_lines_pct", "refund_pct", "refund_orders_pct",
+        "refund_rate_by_orders_cur", "refund_rate_by_orders_prev", "refund_rate_by_orders_diff", "refund_rate_by_orders_pct",
+        "refund_to_sales_ratio_cur", "refund_to_sales_ratio_prev", "refund_to_sales_ratio_diff", "refund_to_sales_ratio_pct",
+        "sku_count_pct"
     ]
+
     for col in pct_cols:
         if col in out.columns:
             out[col] = out[col].apply(lambda x: f"{x * 100:.1f}%" if pd.notna(x) else "N/A")
 
     money_cols = [
-        "sales_cur", "sales_prev", "sales_diff", "refund_cur", "refund_prev", "refund_diff"
+        "sales_cur", "sales_prev", "sales_diff",
+        "refund_cur", "refund_prev", "refund_diff"
     ]
     for col in money_cols:
         if col in out.columns:
@@ -572,6 +691,7 @@ def prepare_display_table(comp_df, attr_col):
     num_cols = [
         "units_cur", "units_prev", "units_diff",
         "order_lines_cur", "order_lines_prev", "order_lines_diff",
+        "refund_orders_cur", "refund_orders_prev", "refund_orders_diff",
         "sku_count_cur", "sku_count_prev", "sku_count_diff"
     ]
     for col in num_cols:
@@ -597,7 +717,15 @@ mapped_only = st.sidebar.checkbox("只分析成功映射属性的记录", value=
 
 metric_choice = st.sidebar.selectbox(
     "Heat Map 指标",
-    options=["sales", "units", "order_lines", "refund"],
+    options=[
+        "sales",
+        "units",
+        "order_lines",
+        "refund",
+        "refund_orders",
+        "refund_rate",
+        "refund_to_sales_ratio",
+    ],
     index=0,
 )
 
@@ -637,6 +765,12 @@ try:
 
     show_kpi_row(merged_cur, merged_prev)
 
+    st.info(
+        "说明：当前分析中，“上架月份 / 上架季度 / 上新阶段”属于根据上架时间自动生成的客观时间属性；"
+        "而你表中原有的季节字段（例如 25C、26X 等）属于主观企划属性。"
+        "两者可以配合使用，用来判断你的季节判断是否和实际销售节奏一致。"
+    )
+
     st.markdown("---")
     st.header("自动分析摘要")
     overall_texts = generate_overall_summary(merged_cur, merged_prev)
@@ -672,21 +806,30 @@ try:
     focus_attr = st.selectbox("选择一个属性看周对比", options=selected_attrs)
 
     comp_df = compare_periods(merged_cur, merged_prev, focus_attr)
+
     display_cols = [
         focus_attr,
         "sales_cur", "sales_prev", "sales_diff", "sales_pct",
         "units_cur", "units_prev", "units_diff", "units_pct",
         "order_lines_cur", "order_lines_prev", "order_lines_diff", "order_lines_pct",
         "refund_cur", "refund_prev", "refund_diff", "refund_pct",
+        "refund_orders_cur", "refund_orders_prev", "refund_orders_diff", "refund_orders_pct",
+        "refund_rate_by_orders_cur", "refund_rate_by_orders_prev", "refund_rate_by_orders_diff",
+        "refund_to_sales_ratio_cur", "refund_to_sales_ratio_prev", "refund_to_sales_ratio_diff",
         "sku_count_cur", "sku_count_prev", "sku_count_diff", "sku_count_pct",
     ]
 
-    comp_df_display = prepare_display_table(comp_df[display_cols].copy(), focus_attr)
+    comp_df_display = prepare_display_table(comp_df[display_cols].copy())
     st.dataframe(comp_df_display, use_container_width=True, hide_index=True)
 
     st.markdown("#### 单属性分析解读")
     attr_texts = generate_attribute_summary(comp_df, focus_attr, metric="sales", top_n=top_summary_n)
     for t in attr_texts:
+        st.write("• " + t)
+
+    st.markdown("#### 退款分析解读")
+    refund_texts = generate_refund_summary(comp_df, focus_attr, top_n=top_summary_n)
+    for t in refund_texts:
         st.write("• " + t)
 
     st.markdown("#### 单属性业务建议")
@@ -696,7 +839,7 @@ try:
 
     chart_metric = st.radio(
         "单属性柱状图指标",
-        options=["sales", "units", "order_lines", "refund"],
+        options=["sales", "units", "order_lines", "refund", "refund_orders", "refund_rate_by_orders", "refund_to_sales_ratio"],
         horizontal=True,
         index=0,
     )
@@ -736,13 +879,12 @@ try:
         pair_scores = []
         for attr_x, attr_y in pair_options:
             src = build_heatmap_source(merged_cur, attr_x, attr_y, metric_choice)
-            score = src["value"].sum() if len(src) else 0
+            score = pd.to_numeric(src["value"], errors="coerce").fillna(0).sum() if len(src) else 0
             pair_scores.append(((attr_x, attr_y), score))
 
         pair_scores = sorted(pair_scores, key=lambda x: x[1], reverse=True)
         display_pairs = [p for p, _ in pair_scores[:max_pair_count]]
         st.write(f"当前自动展示前 {len(display_pairs)} 组组合。")
-
     else:
         col_a, col_b = st.columns(2)
         with col_a:
@@ -776,6 +918,8 @@ try:
         diff_src = diff_src[[attr_x, attr_y, "value"]]
         diff_src_small = keep_top_labels(diff_src, attr_x, attr_y, value_col="value", top_n=heatmap_top_n)
 
+        percent_metric = metric_choice in {"refund_rate", "refund_to_sales_ratio"}
+
         tab1, tab2, tab3 = st.tabs(["近7天", "过去7天", "差异"])
 
         with tab1:
@@ -786,6 +930,7 @@ try:
                 value_col="value",
                 title=f"近7天 - {metric_choice}",
                 diff=False,
+                percent=percent_metric,
             )
 
         with tab2:
@@ -796,6 +941,7 @@ try:
                 value_col="value",
                 title=f"过去7天 - {metric_choice}",
                 diff=False,
+                percent=percent_metric,
             )
 
         with tab3:
@@ -806,28 +952,113 @@ try:
                 value_col="value",
                 title=f"差异（近7天 - 过去7天）- {metric_choice}",
                 diff=True,
+                percent=percent_metric,
             )
 
         with st.expander(f"查看 {attr_x} × {attr_y} 原始明细表", expanded=False):
             col1, col2, col3 = st.columns(3)
 
+            def format_detail_df(df_show, percent=False):
+                out = df_show.copy()
+                if percent:
+                    out["value"] = out["value"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+                else:
+                    out["value"] = out["value"].map(lambda x: f"{x:,.2f}" if pd.notna(x) else "N/A")
+                return out
+
             with col1:
                 st.markdown("**近7天明细**")
-                show_df = cur_src_small.copy()
-                show_df["value"] = show_df["value"].map(lambda x: f"{x:,.2f}")
-                st.dataframe(show_df.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    format_detail_df(cur_src_small.sort_values("value", ascending=False), percent_metric),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             with col2:
                 st.markdown("**过去7天明细**")
-                show_df = prev_src_small.copy()
-                show_df["value"] = show_df["value"].map(lambda x: f"{x:,.2f}")
-                st.dataframe(show_df.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    format_detail_df(prev_src_small.sort_values("value", ascending=False), percent_metric),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
             with col3:
                 st.markdown("**差异明细**")
-                show_df = diff_src_small.copy()
-                show_df["value"] = show_df["value"].map(lambda x: f"{x:,.2f}")
-                st.dataframe(show_df.sort_values("value", ascending=False), use_container_width=True, hide_index=True)
+                st.dataframe(
+                    format_detail_df(diff_src_small.sort_values("value", ascending=False), percent_metric),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+    st.markdown("---")
+    st.header("退款风险专项分析")
+
+    refund_attr = st.selectbox("选择一个属性看退款风险", options=selected_attrs, key="refund_attr")
+    refund_df = compare_periods(merged_cur, merged_prev, refund_attr)
+
+    risk_view = refund_df[[
+        refund_attr,
+        "sales_cur",
+        "refund_cur",
+        "refund_orders_cur",
+        "refund_rate_by_orders_cur",
+        "refund_to_sales_ratio_cur",
+        "sales_diff",
+        "refund_diff",
+        "refund_orders_diff",
+        "refund_rate_by_orders_diff",
+        "refund_to_sales_ratio_diff",
+    ]].copy()
+
+    risk_view_display = risk_view.copy()
+    for col in ["sales_cur", "refund_cur", "sales_diff", "refund_diff"]:
+        risk_view_display[col] = risk_view_display[col].apply(lambda x: f"${x:,.2f}")
+    for col in ["refund_orders_cur", "refund_orders_diff"]:
+        risk_view_display[col] = risk_view_display[col].apply(lambda x: f"{x:,.0f}")
+    for col in ["refund_rate_by_orders_cur", "refund_to_sales_ratio_cur", "refund_rate_by_orders_diff", "refund_to_sales_ratio_diff"]:
+        risk_view_display[col] = risk_view_display[col].apply(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A")
+
+    st.dataframe(risk_view_display, use_container_width=True, hide_index=True)
+
+    top_refund_amt = refund_df.sort_values("refund_cur", ascending=False).head(10)
+    top_refund_rate = refund_df.sort_values("refund_rate_by_orders_cur", ascending=False).head(10)
+    top_refund_ratio = refund_df.sort_values("refund_to_sales_ratio_cur", ascending=False).head(10)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown("**退款金额最高的属性**")
+        st.dataframe(
+            top_refund_amt[[refund_attr, "refund_cur", "sales_cur"]].assign(
+                refund_cur=lambda d: d["refund_cur"].map(lambda x: f"${x:,.2f}"),
+                sales_cur=lambda d: d["sales_cur"].map(lambda x: f"${x:,.2f}")
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with c2:
+        st.markdown("**退款订单占比最高的属性**")
+        st.dataframe(
+            top_refund_rate[[refund_attr, "refund_rate_by_orders_cur", "refund_orders_cur", "order_lines_cur"]].assign(
+                refund_rate_by_orders_cur=lambda d: d["refund_rate_by_orders_cur"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A"),
+                refund_orders_cur=lambda d: d["refund_orders_cur"].map(lambda x: f"{x:,.0f}"),
+                order_lines_cur=lambda d: d["order_lines_cur"].map(lambda x: f"{x:,.0f}")
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with c3:
+        st.markdown("**退款金额占销售额比例最高的属性**")
+        st.dataframe(
+            top_refund_ratio[[refund_attr, "refund_to_sales_ratio_cur", "refund_cur", "sales_cur"]].assign(
+                refund_to_sales_ratio_cur=lambda d: d["refund_to_sales_ratio_cur"].map(lambda x: f"{x:.1%}" if pd.notna(x) else "N/A"),
+                refund_cur=lambda d: d["refund_cur"].map(lambda x: f"${x:,.2f}"),
+                sales_cur=lambda d: d["sales_cur"].map(lambda x: f"${x:,.2f}")
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
 
     st.markdown("---")
     st.header("明细数据导出")
